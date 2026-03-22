@@ -1,0 +1,297 @@
+@startuml CallingAgents System Architecture
+!theme plain
+skinparam backgroundColor #1a1a2e
+skinparam defaultFontColor #e0e0e0
+skinparam defaultFontName "Arial"
+skinparam defaultFontSize 12
+
+skinparam package {
+    BackgroundColor #16213e
+    BorderColor #0f3460
+    FontColor #e94560
+    FontStyle bold
+}
+
+skinparam component {
+    BackgroundColor #0f3460
+    BorderColor #e94560
+    FontColor #e0e0e0
+}
+
+skinparam actor {
+    BackgroundColor #e94560
+    BorderColor #ffffff
+    FontColor #ffffff
+}
+
+skinparam database {
+    BackgroundColor #0f3460
+    BorderColor #e94560
+    FontColor #e0e0e0
+}
+
+skinparam cloud {
+    BackgroundColor #16213e
+    BorderColor #e94560
+    FontColor #e0e0e0
+}
+
+skinparam note {
+    BackgroundColor #0f3460
+    BorderColor #e94560
+    FontColor #e0e0e0
+}
+
+skinparam arrow {
+    Color #e94560
+    FontColor #e0e0e0
+}
+
+title <b>🤖 Rapid X AI — Calling Agents System Architecture</b>
+
+' ============================================================
+' ACTORS / EXTERNAL
+' ============================================================
+actor "👤 User / Operator" as Operator
+actor "📱 Phone User\n(Call Recipient)" as PhoneUser
+
+' ============================================================
+' PACKAGE: Dashboard (Next.js Frontend)
+' ============================================================
+package "📊 Dashboard (Next.js)" {
+
+    component "page.tsx\n[Main UI]" as PageUI
+
+    package "Components" {
+        component "CallDispatcher.tsx\n[Single Call UI]" as CallDisp
+        component "BulkDialer.tsx\n[Bulk Campaign UI]" as BulkDialer
+    }
+
+    package "API Routes" {
+        component "POST /api/dispatch\n[route.ts]" as DispatchAPI
+        component "POST /api/queue\n[route.ts]" as QueueAPI
+    }
+
+    component "server-utils.ts\n[RoomServiceClient + SipClient]" as ServerUtils
+}
+
+' ============================================================
+' PACKAGE: Python Agent (Backend)
+' ============================================================
+package "🐍 Python Agent (LiveKit Worker)" {
+
+    component "agent.py\n[entrypoint()]" as AgentEntry
+    component "config.py\n[SYSTEM_PROMPT\nModel Config\nTTS/STT/LLM Settings]" as ConfigPy
+
+    package "AI Processing Pipeline" {
+        component "Silero VAD\n[Voice Activity Detection]" as VAD
+        component "Deepgram STT\n[Speech-to-Text\nnova-2 model]" as STT
+        component "LLM Builder\n[_build_llm()]" as LLMBuilder
+        component "TTS Builder\n[_build_tts()]" as TTSBuilder
+        component "OutboundAssistant\n[Agent class]" as Assistant
+        component "AgentSession\n[Orchestrates pipeline]" as AgentSess
+    }
+
+    package "Function Tools (LLM Tools)" {
+        component "TransferFunctions\n[ToolContext]" as ToolCtx
+        component "lookup_user()\n[Mock user lookup]" as LookupTool
+        component "transfer_call()\n[SIP Transfer]" as TransferTool
+    }
+
+    component "make_call.py\n[CLI dispatch script]" as MakeCall
+}
+
+' ============================================================
+' PACKAGE: Infrastructure / Utilities
+' ============================================================
+package "🔧 Setup & Utilities" {
+    component "create_trunk.py\n[Create SIP Trunk]" as CreateTrunk
+    component "setup_trunk.py\n[Update SIP Trunk]" as SetupTrunk
+    component "list_trunks.py\n[List all Trunks]" as ListTrunks
+}
+
+' ============================================================
+' PACKAGE: External Cloud Services
+' ============================================================
+package "☁️ LiveKit Cloud" {
+    component "LiveKit Server\n[WebRTC + SIP Signaling]" as LiveKitServer
+    component "Agent Worker\n[Room Job Dispatch]" as WorkerDispatch
+    component "Room\n[call-{phone}-{rand}]" as Room
+    component "SIP Participant\n[sip_{phone_number}]" as SIPParticipant
+    database "AgentDispatch API\n[create_dispatch()]" as DispatchDB
+}
+
+cloud "🌐 Vobiz SIP Trunk\n(PSTN Gateway)" as Vobiz
+
+' ============================================================
+' PACKAGE: External AI Services
+' ============================================================
+package "🤖 External AI Services" {
+    cloud "OpenAI API\n[GPT-4o-mini / TTS-1]" as OpenAI
+    cloud "Groq API\n[Llama-3.3-70b]" as Groq
+    cloud "Deepgram API\n[nova-2 STT + TTS]" as DeepgramAPI
+    cloud "Sarvam AI\n[Indian TTS - bulbul:v2]" as SarvamAI
+    cloud "Cartesia AI\n[sonic-2 TTS]" as CartesiaAI
+}
+
+' ============================================================
+' PACKAGE: Container / Deployment
+' ============================================================
+package "🐳 Docker Deployment" {
+    component "Dockerfile\n[python:3.11-slim]" as DockerFile
+    component "docker-compose.yml\n[voice-agent service]" as DockerCompose
+    component ".env\n[Secrets & Credentials]" as EnvFile
+}
+
+' ============================================================
+' FLOWS: Dashboard → LiveKit
+' ============================================================
+Operator --> PageUI : opens browser
+
+PageUI --> CallDisp : single call tab
+PageUI --> BulkDialer : bulk campaign tab
+
+CallDisp --> DispatchAPI : POST\n{phoneNumber, prompt,\nmodelProvider, voice}
+BulkDialer --> QueueAPI : POST\n{numbers[], prompt}
+
+DispatchAPI --> ServerUtils : uses SipClient
+QueueAPI --> ServerUtils : uses SipClient + RoomService
+
+ServerUtils --> LiveKitServer : SDK calls\n(livekit-server-sdk)
+
+' ============================================================
+' FLOWS: CLI make_call.py → LiveKit
+' ============================================================
+Operator --> MakeCall : python make_call.py --to +91...
+MakeCall --> LiveKitServer : CreateAgentDispatchRequest\n(agent_name="outbound-caller"\nroom, metadata)
+MakeCall --> DispatchDB : create_dispatch()
+
+' ============================================================
+' FLOWS: LiveKit → Agent Worker
+' ============================================================
+DispatchDB --> WorkerDispatch : dispatches job\nto agent worker
+WorkerDispatch --> AgentEntry : invokes entrypoint(ctx)\nwith job metadata
+
+' ============================================================
+' FLOWS: Agent Internal Pipeline
+' ============================================================
+AgentEntry --> ConfigPy : reads SYSTEM_PROMPT,\nSIP_TRUNK_ID, models
+AgentEntry --> LLMBuilder : _build_llm()\n[openai/groq]
+AgentEntry --> TTSBuilder : _build_tts()\n[openai/sarvam/deepgram/cartesia]
+AgentEntry --> VAD : silero.VAD.load()
+AgentEntry --> STT : deepgram.STT(nova-2)
+AgentEntry --> ToolCtx : TransferFunctions(ctx, phone_number)
+
+LLMBuilder --> Assistant : injects LLM
+TTSBuilder --> Assistant : injects TTS
+VAD --> AgentSess : pipeline component
+STT --> AgentSess : pipeline component
+LLMBuilder --> AgentSess : pipeline component
+TTSBuilder --> AgentSess : pipeline component
+ToolCtx --> Assistant : injects tools
+
+Assistant --> AgentSess : starts with Agent
+AgentSess --> Room : session.start(room=ctx.room)
+
+ToolCtx --> LookupTool : contains
+ToolCtx --> TransferTool : contains
+
+' ============================================================
+' FLOWS: Agent → Dial Out via SIP
+' ============================================================
+AgentEntry --> LiveKitServer : CreateSIPParticipantRequest\n(trunk_id, phone_number, room_name\nwait_until_answered=True)
+LiveKitServer --> Vobiz : outbound SIP INVITE\n(via trunk)
+Vobiz --> PhoneUser : 📞 PSTN Call\n(rings phone)
+PhoneUser --> Vobiz : picks up
+Vobiz --> SIPParticipant : SIP 200 OK
+SIPParticipant --> Room : joins room as participant
+Room --> AgentSess : audio stream active
+
+' ============================================================
+' FLOWS: Call Audio Loop
+' ============================================================
+PhoneUser --> VAD : voice audio stream
+VAD --> STT : detected speech
+STT --> LLMBuilder : transcript text
+LLMBuilder --> TTSBuilder : AI response text
+TTSBuilder --> PhoneUser : synthesized speech
+
+' ============================================================
+' FLOWS: Transfer Tool
+' ============================================================
+TransferTool --> LiveKitServer : TransferSIPParticipantRequest\n(sip:{dest}@{domain})
+LiveKitServer --> Vobiz : SIP REFER\n(transfer to human)
+Vobiz --> PhoneUser : transfers call
+
+' ============================================================
+' FLOWS: External AI Services
+' ============================================================
+LLMBuilder --> OpenAI : if provider=openai
+LLMBuilder --> Groq : if provider=groq
+TTSBuilder --> OpenAI : if TTS provider=openai\n(voice: alloy/echo/shimmer)
+TTSBuilder --> DeepgramAPI : if TTS provider=deepgram
+TTSBuilder --> SarvamAI : if TTS provider=sarvam\n(voice: anushka/aravind - Indian)
+TTSBuilder --> CartesiaAI : if TTS provider=cartesia\n(sonic-2)
+STT --> DeepgramAPI : always (nova-2)
+
+' ============================================================
+' FLOWS: Setup Utilities
+' ============================================================
+Operator --> CreateTrunk : one-time setup\n(create Vobiz SIP trunk)
+Operator --> SetupTrunk : update credentials
+Operator --> ListTrunks : verify trunk IDs
+CreateTrunk --> LiveKitServer : CreateSIPOutboundTrunkRequest
+SetupTrunk --> LiveKitServer : update_outbound_trunk_fields()
+ListTrunks --> LiveKitServer : list_outbound_trunk()
+
+' ============================================================
+' FLOWS: Docker Deployment
+' ============================================================
+DockerCompose --> DockerFile : builds image
+DockerFile --> AgentEntry : CMD: python agent.py start
+EnvFile --> DockerCompose : env_file: .env
+EnvFile --> AgentEntry : loaded by dotenv
+
+' ============================================================
+' NOTES
+' ============================================================
+note right of ConfigPy
+  **Agent Persona:** Rapid X High School Receptionist
+  **Language:** English + Hindi (multilingual)
+  **Behaviors:**
+  - Answer admissions, fees, timings
+  - Transfer to Principal if asked
+  - End call with Namaste
+end note
+
+note right of Room
+  **Room Name Format:**
+  call-{e164_number}-{random 1000-9999}
+  
+  **Metadata (JSON):**
+  {
+    phone_number: "+91...",
+    user_prompt: "...",
+    model_provider: "openai|groq",
+    voice_id: "alloy|anushka|..."
+  }
+end note
+
+note bottom of Vobiz
+  **SIP Trunk Credentials:**
+  VOBIZ_SIP_DOMAIN
+  VOBIZ_USERNAME
+  VOBIZ_PASSWORD
+  VOBIZ_OUTBOUND_NUMBER
+  VOBIZ_SIP_TRUNK_ID
+end note
+
+note bottom of BulkDialer
+  **Bulk Campaign Flow:**
+  1. Parse CSV / newline numbers
+  2. For each number: create Room + SIP Participant
+  3. 200ms delay between calls
+  4. Report dispatched/failed per number
+end note
+
+@enduml

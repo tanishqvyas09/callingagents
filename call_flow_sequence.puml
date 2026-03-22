@@ -1,0 +1,164 @@
+@startuml CallingAgents Call Flow Sequence
+!theme plain
+skinparam backgroundColor #1a1a2e
+skinparam defaultFontColor #e0e0e0
+skinparam defaultFontName "Arial"
+skinparam defaultFontSize 11
+
+skinparam participant {
+    BackgroundColor #0f3460
+    BorderColor #e94560
+    FontColor #e0e0e0
+}
+
+skinparam actor {
+    BackgroundColor #e94560
+    BorderColor #ffffff
+    FontColor #ffffff
+}
+
+skinparam sequence {
+    ArrowColor #e94560
+    LifeLineBackgroundColor #16213e
+    LifeLineBorderColor #e94560
+    MessageAlignment center
+    GroupBackgroundColor #16213e
+    GroupBorderColor #e94560
+    GroupFontColor #e94560
+}
+
+skinparam note {
+    BackgroundColor #0f3460
+    BorderColor #e94560
+    FontColor #e0e0e0
+}
+
+title <b>🔄 Rapid X AI — End-to-End Outbound Call Sequence</b>
+
+' ============================================================
+actor "Operator" as Op
+participant "Dashboard\n/ CLI\nmake_call.py" as UI
+participant "LiveKit\nCloud" as LK
+participant "agent.py\n(Worker)" as Agent
+participant "Deepgram\n(STT)" as STT
+participant "OpenAI/Groq\n(LLM)" as LLM
+participant "TTS\n(OpenAI/Sarvam\n/Deepgram)" as TTS
+participant "Vobiz SIP\nTrunk" as SIP
+actor "📱 Phone User" as Phone
+
+' ============================================================
+== 1. DISPATCH PHASE ==
+' ============================================================
+
+Op -> UI : Enter phone number\n+ config (model, voice, prompt)
+
+alt CLI Path (make_call.py)
+    UI -> LK : CreateAgentDispatchRequest\n(agent_name="outbound-caller",\nroom=call-{phone}-{rand},\nmetadata={phone_number, ...})
+    LK --> UI : Dispatch ID
+else Dashboard Path (/api/dispatch)
+    UI -> LK : createSipParticipant(trunkId, phone, roomName)\nwith roomMetadata={phone_number,...}
+    LK --> UI : sipCallId
+end
+
+UI --> Op : ✅ Dispatched / Call ID
+
+' ============================================================
+== 2. AGENT STARTUP PHASE ==
+' ============================================================
+
+LK -> Agent : Job dispatched to worker\nentrypoint(ctx) called
+
+Agent -> Agent : Parse job.metadata / room.metadata\nExtract: phone_number, model_provider,\nvoice_id, user_prompt
+
+Agent -> Agent : silero.VAD.load()\ndeepgram.STT(nova-2)\n_build_llm() → OpenAI/Groq\n_build_tts() → OpenAI/Sarvam/Deepgram/Cartesia
+
+note right of Agent
+  **OutboundAssistant** created with:
+  - SYSTEM_PROMPT (from config.py)
+  - Tools: lookup_user(), transfer_call()
+  - Dynamic LLM + TTS from metadata
+end note
+
+Agent -> LK : session.start(room, agent, RoomInputOptions\n[noise_cancellation=BVCTelephony])
+
+' ============================================================
+== 3. DIAL-OUT PHASE ==
+' ============================================================
+
+Agent -> LK : CreateSIPParticipantRequest\n(sip_trunk_id=VOBIZ_TRUNK_ID,\nsip_call_to=phone_number,\nparticipant_identity=sip_{phone},\nwait_until_answered=True)
+
+LK -> SIP : SIP INVITE → {phone_number}
+SIP -> Phone : 📞 PSTN Ring
+
+Phone -> SIP : Answer (200 OK)
+SIP -> LK : SIP Participant joined room
+LK --> Agent : wait_until_answered ✅ resolved
+
+Agent -> LK : session.generate_reply()\nINSTRUCTION: "Introduce yourself\nas School Receptionist"
+
+' ============================================================
+== 4. CONVERSATION LOOP ==
+' ============================================================
+
+loop Active Conversation
+
+    Agent -> TTS : Generate greeting / response text
+    TTS --> Phone : 🔊 Synthesized Speech\n"Hello! I'm the receptionist\nof Rapid X High School..."
+
+    Phone -> SIP : User Speaks
+    SIP -> LK : Audio stream
+    LK -> Agent : audio RTP
+    Agent -> STT : raw audio frames
+    STT --> Agent : transcript text\n("I want to know about admissions")
+
+    Agent -> LLM : system_prompt + conversation_history\n+ latest user transcript
+    LLM --> Agent : response text\n("Admissions are open for Grade 1-10...")
+
+    Agent -> TTS : response text
+    TTS --> Phone : 🔊 AI Voice Response
+
+    alt User asks to transfer to Principal
+        Agent -> LLM : decides to call transfer_call()
+        LLM --> Agent : invoke tool: transfer_call(destination)
+        Agent -> LK : TransferSIPParticipantRequest\n(sip:{dest}@{domain},\nplay_dialtone=False)
+        LK -> SIP : SIP REFER
+        SIP -> Phone : 📞 Call transferred to human
+    end
+
+    alt User says "Bye" / disconnects
+        Phone -> SIP : BYE / Hangup
+        SIP -> LK : SIP participant left
+        LK -> Agent : room.close_on_disconnect
+        Agent -> Agent : ctx.shutdown()
+    end
+
+end
+
+' ============================================================
+== 5. BULK CAMPAIGN PATH (BulkDialer) ==
+' ============================================================
+
+group Bulk Campaign (BulkDialer.tsx → /api/queue)
+    Op -> UI : Enter CSV phone numbers\n+ campaign prompt
+    loop For each phone number
+        UI -> LK : roomService.createRoom(roomName, metadata)
+        UI -> LK : createSipParticipant(trunkId, phoneNumber, roomName)
+        UI -> UI : wait 200ms (rate limiting)
+        LK -> SIP : SIP INVITE per number
+        SIP -> Phone : 📞 Ring each number in parallel
+    end
+    UI --> Op : Report: dispatched/failed per number
+end
+
+' ============================================================
+== 6. SETUP / ADMIN UTILITIES ==
+' ============================================================
+
+group One-Time SIP Trunk Setup
+    Op -> LK : create_trunk.py → CreateSIPOutboundTrunkRequest\n(Vobiz domain, username, password, number)
+    LK --> Op : SIP Trunk ID → save to .env
+    Op -> LK : setup_trunk.py → update_outbound_trunk_fields()\n(update credentials if needed)
+    Op -> LK : list_trunks.py → list_outbound_trunk()\n(verify trunk IDs)
+end
+
+@enduml
