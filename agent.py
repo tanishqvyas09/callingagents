@@ -4,7 +4,6 @@ import certifi
 # Fix for macOS SSL Certificate errors - MUST be before other imports
 os.environ['SSL_CERT_FILE'] = certifi.where()
 
-import asyncio
 import logging
 import json
 from dotenv import load_dotenv
@@ -216,6 +215,24 @@ async def entrypoint(ctx: agents.JobContext):
     # Initialize function context
     fnc_ctx = TransferFunctions(ctx, phone_number)
 
+    # Initialize the Agent Session with plugins
+    session = AgentSession(
+        vad=silero.VAD.load(),
+        stt=deepgram.STT(model=config.STT_MODEL, language=config.STT_LANGUAGE), 
+        llm=_build_llm(config_dict.get("model_provider")),
+        tts=_build_tts(config_dict.get("model_provider"), config_dict.get("voice_id")),
+    )
+
+    # Start the session
+    await session.start(
+        room=ctx.room,
+        agent=OutboundAssistant(tools=list(fnc_ctx.function_tools.values())),
+        room_input_options=RoomInputOptions(
+            noise_cancellation=noise_cancellation.BVCTelephony(),
+            close_on_disconnect=True, # Close room when agent disconnects
+        ),
+    )
+
     # Logic to dial out:
     # 1. If 'phone_number' is present, we MIGHT need to dial.
     # 2. Check if a SIP participant is already in the room (Dashboard dispatch case).
@@ -233,58 +250,44 @@ async def entrypoint(ctx: agents.JobContext):
             should_dial = True
             logger.info("User not in room. Agent will initiate dial-out.")
         else:
-            logger.info("User already in room (Dashboard dispatched). Only generating greeting.")
+            logger.info("User already in room (Dashboard dispatched). output Only generated greeting.")
 
     if should_dial:
         logger.info(f"Initiating outbound SIP call to {phone_number}...")
         try:
+            # Create a SIP participant to dial out
+            # This effectively "calls" the phone number and brings them into this room
             # --- CONNECTING TO THE PHONE NETWORK ---
-            # Dial the number FIRST, BEFORE starting the session.
-            # wait_until_answered=True blocks here until the person picks up.
+            # This step actually "dials" the number using Vobiz (SIP Trunk).
+            # It invites the phone number into this digital room.
             await ctx.api.sip.create_sip_participant(
                 api.CreateSIPParticipantRequest(
                     room_name=ctx.room.name,
                     sip_trunk_id=config.SIP_TRUNK_ID,
                     sip_call_to=phone_number,
-                    participant_identity=f"sip_{phone_number}",
-                    wait_until_answered=True,
+                    participant_identity=f"sip_{phone_number}", # Unique ID for the SIP user
+                    wait_until_answered=True, # Important: Wait for pickup before continuing
                 )
             )
-            logger.info("Call answered! Starting agent session now.")
-            # Brief pause to let the SIP audio path fully stabilize
-            await asyncio.sleep(1.0)
+            logger.info("Call answered! Agent is now listening.")
+            
+            # Note: We do NOT generate an initial reply here immediately.
+            # Usually for outbound, we want to hear "Hello?" from the user first,
+            # OR we can speak immediately. 
+            # If you want the agent to speak first, uncomment the lines below:
+            
+            await session.generate_reply(
+                instructions=config.INITIAL_GREETING
+            )
             
         except Exception as e:
             logger.error(f"Failed to place outbound call: {e}")
+            # Ensure we clean up if the call fails
             ctx.shutdown()
-            return
-
-    # Initialize the Agent Session AFTER the call is answered (or user is already present).
-    # This ensures Deepgram STT only opens its WebSocket once there is live audio to stream.
-    session = AgentSession(
-        vad=silero.VAD.load(),
-        stt=deepgram.STT(model=config.STT_MODEL, language=config.STT_LANGUAGE),
-        llm=_build_llm(config_dict.get("model_provider")),
-        tts=_build_tts(config_dict.get("model_provider"), config_dict.get("voice_id")),
-    )
-
-    await session.start(
-        room=ctx.room,
-        agent=OutboundAssistant(tools=list(fnc_ctx.function_tools.values())),
-        room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.BVCTelephony(),
-            close_on_disconnect=True,
-        ),
-    )
-
-    if should_dial:
-        # Outbound call: agent speaks first with the initial greeting
-        await session.generate_reply(
-            instructions=config.INITIAL_GREETING
-        )
     else:
-        # Inbound / Dashboard dispatched: user is already in the room
-        logger.info("Generating fallback greeting...")
+        # Fallback for inbound calls (if this agent is used for that) OR Dashboard calls where user is already there
+        logger.info("Detecting if we should greet...")
+        # Give a small delay for audio to stabilize if user just joined
         await session.generate_reply(instructions=config.fallback_greeting)
 
 
@@ -296,9 +299,3 @@ if __name__ == "__main__":
             agent_name="outbound-caller", 
         )
     )
-
-
-
-
-
-

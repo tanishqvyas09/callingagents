@@ -62,6 +62,27 @@ export default function Home() {
           </div>
         </section>
 
+        {/* ── Section 3: NGO Dashboard link ── */}
+        <section className="w-full flex flex-col items-center gap-4 animate-in fade-in slide-in-from-bottom-8 duration-1000 delay-300">
+          <div className="flex items-center gap-3">
+            <div className="h-px w-16 bg-gradient-to-r from-transparent to-rose-500/50" />
+            <span className="text-xs font-semibold text-rose-400 uppercase tracking-widest">
+              🌸 NGO — Making the Difference · Team Lajja Survey
+            </span>
+            <div className="h-px w-16 bg-gradient-to-l from-transparent to-rose-500/50" />
+          </div>
+          <a
+            href="/ngo"
+            className="px-8 py-4 rounded-2xl bg-gradient-to-r from-rose-600 to-purple-600 text-white font-bold text-lg shadow-lg hover:scale-105 transition-transform"
+          >
+            🌸 Open NGO Menstrual Hygiene Dashboard →
+          </a>
+          <p className="text-xs text-gray-500 text-center max-w-md">
+            Multilingual outbound survey (Hindi · English · Telugu) with real-time millisecond analytics.
+            Powered by Sarvam saaras:v3 STT + bulbul:v3 TTS + Groq LLM.
+          </p>
+        </section>
+
         <footer className="text-sm text-gray-500 animate-in fade-in duration-1000 delay-500 text-center space-y-2">
           <p>Powered by <span className="text-white font-semibold">Rapid X AI</span></p>
           <div className="flex gap-4 justify-center text-xs">
