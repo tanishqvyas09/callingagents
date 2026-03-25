@@ -17,7 +17,7 @@ multilingual support (Hindi · English · Telugu) and a real-time analytics dash
        │  WebSocket (livekit-client)                       │
        ▼                                                   ▼
   NGOAnalytics.tsx                            Sarvam saaras:v3 STT
-  (real-time feed)                            Groq llama-4-maverick LLM
+  (real-time feed)                            Groq llama-4-maverick LLM  →  Groq openai/gpt-oss-120b LLM
                                               Sarvam bulbul:v3 TTS (shubh)
                                               Vobiz SIP trunk → +91 phones
 ```
@@ -103,8 +103,10 @@ VOBIZ_SIP_DOMAIN=78efb265.sip.vobiz.ai
    every `FINAL_TRANSCRIPT` event.
 
 3. **TTS rebuild**: If the detected language differs from the current TTS language, the agent
-   calls `session.update_tts(new_tts)` with a freshly-constructed `sarvam.TTS` pointing to
-   the new `target_language_code`. This happens **every turn**.
+   directly assigns `self._tts` and `session._tts` to a freshly-constructed `sarvam.TTS`
+   pointing to the new `target_language_code`. This happens **every turn**.
+   (Note: `AgentSession.update_tts()` does not exist in livekit-agents 1.4.3 — direct
+   attribute assignment is used instead.)
 
 4. **Dashboard**: A `stt` analytics event is emitted with `lang_switched: true/false` and
    `language_resolved` — visible in the NGOAnalytics panel highlighted in amber.
