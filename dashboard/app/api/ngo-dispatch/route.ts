@@ -5,7 +5,15 @@
  * and (if phone_number provided) the agent itself will initiate the SIP call.
  *
  * Body:
- *   { phone_number: string; participant_name?: string; notes?: string }
+ *   {
+ *     phone_number: string;
+ *     participant_name?: string;
+ *     student_name?: string;
+ *     student_age?: number | null;
+ *     school_name?: string | null;
+ *     school_city?: string | null;
+ *     notes?: string;
+ *   }
  *
  * Returns:
  *   { room_name, ws_url, token, job_id? }
@@ -25,9 +33,13 @@ const LK_SECRET = process.env.LIVEKIT_API_SECRET!;
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { phone_number, participant_name, notes } = body as {
+    const { phone_number, participant_name, student_name, student_age, school_name, school_city, notes } = body as {
       phone_number?: string;
       participant_name?: string;
+      student_name?: string;
+      student_age?: number | null;
+      school_name?: string | null;
+      school_city?: string | null;
       notes?: string;
     };
 
@@ -38,6 +50,10 @@ export async function POST(req: NextRequest) {
     const roomMeta = JSON.stringify({
       phone_number:     phone_number || null,
       participant_name: participant_name || "student",
+      student_name:     student_name || null,
+      student_age:      student_age ?? null,
+      school_name:      school_name || null,
+      school_city:      school_city || null,
       notes:            notes || "",
       ngo:              "Making the Difference",
       team:             "Team Lajja",
