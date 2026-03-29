@@ -3,6 +3,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
 import type { NgoStudent } from "../../lib/supabase";
+import type { CallEndedPayload } from "../../components/CallResultModal";
 
 const NGOAnalytics = dynamic(() => import("../../components/NGOAnalytics"), {
   ssr: false,
@@ -11,6 +12,10 @@ const NGOAnalytics = dynamic(() => import("../../components/NGOAnalytics"), {
       Loading analytics...
     </div>
   ),
+});
+
+const CallResultModal = dynamic(() => import("../../components/CallResultModal"), {
+  ssr: false,
 });
 
 interface DispatchResult {
@@ -48,6 +53,14 @@ export default function NGOPage() {
   const [callState, setCallState] = useState<CallState>("idle");
   const [callError, setCallError] = useState<string | null>(null);
   const [dispatchResult, setDispatchResult] = useState<DispatchResult | null>(null);
+
+  // Call result modal state
+  const [callEndedPayload, setCallEndedPayload] = useState<CallEndedPayload | null>(null);
+
+  const handleCallEnded = useCallback((payload: CallEndedPayload) => {
+    setCallEndedPayload(payload);
+    setCallState("idle");
+  }, []);
 
   // Debounced search
   useEffect(() => {
@@ -408,6 +421,16 @@ export default function NGOPage() {
             )}
           </div>
 
+          {/* View last result button (when call ended and modal is closed) */}
+          {callEndedPayload && callState === "idle" && (
+            <button
+              onClick={() => setCallEndedPayload(callEndedPayload)}
+              className="w-full bg-violet-900 hover:bg-violet-800 border border-violet-700 text-violet-200 font-semibold py-2.5 rounded-xl transition-colors text-sm flex items-center justify-center gap-2"
+            >
+              <span>📊</span> View Last Call Results
+            </button>
+          )}
+
           {/* Session details */}
           {dispatchResult && (
             <div className="bg-slate-900 border border-slate-800 rounded-xl p-3 space-y-2">
@@ -457,6 +480,7 @@ export default function NGOPage() {
                 wsUrl={dispatchResult.ws_url}
                 token={dispatchResult.token}
                 roomName={dispatchResult.room_name}
+                onCallEnded={handleCallEnded}
               />
             </div>
           ) : (
@@ -480,6 +504,14 @@ export default function NGOPage() {
           )}
         </section>
       </main>
+
+      {/* ── Call Result Modal (shown after call ends) ── */}
+      {callEndedPayload && (
+        <CallResultModal
+          payload={callEndedPayload}
+          onClose={() => setCallEndedPayload(null)}
+        />
+      )}
     </div>
   );
 }

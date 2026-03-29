@@ -178,6 +178,11 @@ class NGOAssistant(Agent):
         self._turn_start_ms: int = 0
         self._last_transcript: str = ""
 
+        # ── Full conversation transcript ─────────────────────────────────────
+        # Accumulated as the call progresses — emitted in call_ended event.
+        # Each entry: {"role": "user"|"agent", "text": "...", "lang": "...", "ts_ms": int}
+        self._conversation_log: list[dict] = []
+
         # ── Language debounce: require 2 consecutive turns in same language ──
         # before committing a permanent TTS switch.  This prevents single-word
         # noise detections (e.g. "gu-IN" from one ambiguous utterance) from
@@ -186,10 +191,17 @@ class NGOAssistant(Agent):
         self._lang_streak: int = 0                          # consecutive turns in pending_lang
 
         # ── End-call flag ────────────────────────────────────────────────────
-        # Set to True when [END_CALL] marker is detected in tts_node.
-        # on_agent_state_changed watches for speaking → listening transition
+        # Set to True ONLY when [END_CALL] marker is detected in tts_node.
+        # _on_agent_state_changed watches for speaking → listening/idle
         # and deletes the room only after TTS audio has fully played out.
+        #
+        # Safety: reset to False if a new user utterance arrives AFTER the flag
+        # was set — this means the LLM hallucinated [END_CALL] mid-call and the
+        # student is still talking.  We must NOT delete the room in that case.
         self._end_call_pending: bool = False
+        # Track whether the agent was in 'speaking' state so we only fire the
+        # delete on a genuine speaking→listening transition, not any listening event.
+        self._agent_was_speaking: bool = False
 
         # Hook into session events
         session.on("user_input_transcribed", self._on_transcribed)
@@ -251,6 +263,17 @@ class NGOAssistant(Agent):
         self._last_transcript = transcript
         self._turn_start_ms   = int(time.time() * 1000)
 
+        # ── Safety: cancel any pending end-call if student is still talking ──
+        # The LLM occasionally hallucinates [END_CALL] mid-call (e.g. in a
+        # transition sentence). If the student speaks after the flag was set,
+        # the call is NOT over — clear the flag so we don't hang up.
+        if self._end_call_pending:
+            logger.warning(
+                "[NGO] Student spoke after [END_CALL] was set — cancelling pending delete "
+                f"(transcript='{transcript[:60]}'). LLM likely hallucinated the marker."
+            )
+            self._end_call_pending = False
+
         resolved = self._resolve_tts_lang(detected_lang_raw)
 
         # ── Language debounce ────────────────────────────────────────────────
@@ -305,6 +328,14 @@ class NGOAssistant(Agent):
             + (" [SWITCH]" if lang_switched else "")
         )
 
+        # Log user turn to conversation log
+        self._conversation_log.append({
+            "role": "user",
+            "text": transcript,
+            "lang": new_lang,
+            "ts_ms": int(time.time() * 1000),
+        })
+
         asyncio.ensure_future(self._emit(
             "stt",
             transcript=transcript,
@@ -330,14 +361,45 @@ class NGOAssistant(Agent):
         Watch for the speaking → listening/idle transition.
         When _end_call_pending is True (set by tts_node after stripping [END_CALL]),
         this means the closing TTS has fully finished playing — safe to delete the room.
+
+        Guard: only fire on a genuine speaking→listening transition using
+        _agent_was_speaking. This prevents the 'listening' events that fire
+        between normal mid-call turns from accidentally triggering deletion.
         """
         new_state = ev.new_state if hasattr(ev, "new_state") else str(ev)
-        if self._end_call_pending and new_state in ("listening", "idle"):
-            self._end_call_pending = False
-            logger.info(
-                f"[NGO] Agent finished speaking (state={new_state}) — "
-                f"deleting room {self._room.name} to send SIP BYE"
+
+        if new_state == "speaking":
+            self._agent_was_speaking = True
+
+        elif new_state in ("listening", "idle"):
+            if self._end_call_pending and self._agent_was_speaking:
+                self._end_call_pending   = False
+                self._agent_was_speaking = False
+                logger.info(
+                    f"[NGO] Agent finished speaking (state={new_state}) — "
+                    f"deleting room {self._room.name} to send SIP BYE"
+                )
+                asyncio.ensure_future(self._emit_call_ended())
+            else:
+                # Regular turn end — reset speaking flag only
+                self._agent_was_speaking = False
+
+    async def _emit_call_ended(self) -> None:
+        """Emit call_ended analytics event then delete the room."""
+        try:
+            await self._emit(
+                "call_ended",
+                conversation=self._conversation_log,
+                student_name=self._student_name,
+                student_age=self._student_age,
+                school_name=self._school_name,
+                school_city=self._school_city,
+                total_turns=len([t for t in self._conversation_log if t["role"] == "user"]),
+                detected_language=self._current_lang,
             )
+        except Exception as e:
+            logger.warning(f"[NGO] call_ended emit error: {e}")
+        finally:
             self._ctx.delete_room()
 
     # ── tts_node: guard against script/language mismatch + [END_CALL] detection ──
@@ -373,6 +435,15 @@ class NGOAssistant(Agent):
             self._end_call_pending = True
             # Rebuild chunks from cleaned text (marker stripped)
             chunks = [accumulated] if accumulated else []
+
+        # ── Log agent turn to conversation log ───────────────────────────────
+        if accumulated:
+            self._conversation_log.append({
+                "role": "agent",
+                "text": accumulated,
+                "lang": self._current_lang,
+                "ts_ms": int(time.time() * 1000),
+            })
 
         # ── Script / language detection ──────────────────────────────────────
         if accumulated:

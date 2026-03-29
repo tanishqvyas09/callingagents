@@ -7,7 +7,7 @@
  * "ngo-analytics" data channel topic for events emitted by ngo_agent.py.
  *
  * Event types:
- *   session_start | stt_start | stt | user_turn | tts_start | tts_done | call_answered | call_failed
+ *   session_start | stt_start | stt | user_turn | tts_start | tts_done | call_answered | call_failed | call_ended
  *
  * Displays a millisecond-level live feed of:
  *   • User transcript + detected language
@@ -16,6 +16,8 @@
  *   • Per-turn latencies: STT, LLM (TTFA), E2E
  *   • Language switches highlighted
  *   • Connection state chip
+ *
+ * Fires onCallEnded(payload) when the call_ended event is received.
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -26,6 +28,7 @@ import {
   ConnectionState,
   Participant,
 } from "livekit-client";
+import type { CallEndedPayload } from "./CallResultModal";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface AnalyticsEvent {
@@ -67,6 +70,7 @@ interface Props {
   wsUrl: string;
   token: string;
   roomName: string;
+  onCallEnded?: (payload: CallEndedPayload) => void;
 }
 
 // ─── Language badge colours ───────────────────────────────────────────────────
@@ -89,7 +93,7 @@ function timeLabel(ts: number) {
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
-export default function NGOAnalytics({ wsUrl, token, roomName }: Props) {
+export default function NGOAnalytics({ wsUrl, token, roomName, onCallEnded }: Props) {
   const roomRef   = useRef<Room | null>(null);
   const [connState,   setConnState]   = useState<string>("idle");
   const [sessionInfo, setSessionInfo] = useState<SessionInfo | null>(null);
@@ -99,6 +103,8 @@ export default function NGOAnalytics({ wsUrl, token, roomName }: Props) {
   const pendingTurn   = useRef<Partial<TurnRecord>>({});
   const turnCounter   = useRef(0);
   const feedRef       = useRef<HTMLDivElement>(null);
+  // Full conversation log (user + agent turns) for call_ended → result modal
+  const conversationLog = useRef<CallEndedPayload["conversation"]>([]);
 
   // ── Scroll latest into view ────────────────────────────────────────────────
   useEffect(() => {
@@ -113,6 +119,8 @@ export default function NGOAnalytics({ wsUrl, token, roomName }: Props) {
       case "session_start":
         setSessionInfo(ev as unknown as SessionInfo);
         setCallStatus("connecting");
+        // Reset conversation log on new session
+        conversationLog.current = [];
         break;
 
       case "call_answered":
@@ -140,6 +148,15 @@ export default function NGOAnalytics({ wsUrl, token, roomName }: Props) {
           stt_latency_ms:  Number(ev.stt_latency_ms  ?? 0),
           confidence:      Number(ev.confidence       ?? 0),
         };
+        // Log user turn into conversation log
+        if (ev.transcript) {
+          conversationLog.current.push({
+            role: "user",
+            text: String(ev.transcript),
+            lang: String(ev.language_resolved ?? ""),
+            ts_ms: ev.ts_ms,
+          });
+        }
         break;
       }
 
@@ -162,6 +179,15 @@ export default function NGOAnalytics({ wsUrl, token, roomName }: Props) {
           tts_ttfa_ms:    pendingTurn.current.tts_ttfa_ms     ?? 0,
           e2e_latency_ms: pendingTurn.current.e2e_latency_ms  ?? 0,
         };
+        // Log agent turn into conversation log
+        if (ev.llm_response_text) {
+          conversationLog.current.push({
+            role: "agent",
+            text: String(ev.llm_response_text),
+            lang: String(ev.tts_language ?? ""),
+            ts_ms: ev.ts_ms,
+          });
+        }
         setTurns(prev => [...prev, t]);
         pendingTurn.current = {};
         break;
@@ -181,8 +207,30 @@ export default function NGOAnalytics({ wsUrl, token, roomName }: Props) {
         };
         break;
       }
+
+      case "call_ended": {
+        setCallStatus("ended");
+        // Use conversation from event payload (authoritative from agent)
+        // or fall back to what we tracked here
+        const evConversation = Array.isArray(ev.conversation) && ev.conversation.length > 0
+          ? (ev.conversation as CallEndedPayload["conversation"])
+          : conversationLog.current;
+
+        if (onCallEnded) {
+          onCallEnded({
+            conversation:      evConversation,
+            student_name:      ev.student_name as string | null | undefined,
+            student_age:       ev.student_age as number | null | undefined,
+            school_name:       ev.school_name as string | null | undefined,
+            school_city:       ev.school_city as string | null | undefined,
+            total_turns:       ev.total_turns as number | undefined,
+            detected_language: ev.detected_language as string | undefined,
+          });
+        }
+        break;
+      }
     }
-  }, []);
+  }, [onCallEnded]);
 
   // ── LiveKit room connection ────────────────────────────────────────────────
   useEffect(() => {
@@ -225,6 +273,7 @@ export default function NGOAnalytics({ wsUrl, token, roomName }: Props) {
     connecting: "text-yellow-600",
     "in-call":  "text-green-600",
     failed:     "text-red-600",
+    ended:      "text-slate-400",
   };
 
   return (
