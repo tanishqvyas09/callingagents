@@ -120,6 +120,7 @@ def _build_llm() -> openai.LLM:
         api_key=os.getenv("GROQ_API_KEY"),
         model=cfg.LLM_MODEL,
         temperature=cfg.LLM_TEMPERATURE,
+        max_completion_tokens=cfg.LLM_MAX_COMPLETION_TOKENS,
     )
 
 
@@ -215,9 +216,13 @@ class NGOAssistant(Agent):
         self._egress_id: str | None = None
         self._recording_url: str | None = None
 
+        # ── Guard: ensure call_ended is emitted exactly once ─────────────────
+        self._call_ended_emitted: bool = False
+
         # Hook into session events
         session.on("user_input_transcribed", self._on_transcribed)
         session.on("agent_state_changed", self._on_agent_state_changed)
+        session.on("close", self._on_session_close)
 
     # ── Data channel helper ──────────────────────────────────────────────────
     async def _emit(self, event_type: str, **payload):
@@ -459,8 +464,16 @@ class NGOAssistant(Agent):
                 # Regular turn end — reset speaking flag only
                 self._agent_was_speaking = False
 
-    async def _emit_call_ended(self) -> None:
-        """Emit call_ended analytics event, stop egress, then delete the room."""
+    async def _emit_call_ended(self, *, reason: str = "agent_end") -> None:
+        """Emit call_ended analytics event, stop egress, then delete the room.
+
+        Idempotent — safe to call from both [END_CALL] path and session-close path.
+        """
+        if self._call_ended_emitted:
+            logger.info("[NGO] _emit_call_ended already fired — skipping duplicate")
+            return
+        self._call_ended_emitted = True
+
         try:
             await self._emit(
                 "call_ended",
@@ -472,13 +485,39 @@ class NGOAssistant(Agent):
                 total_turns=len([t for t in self._conversation_log if t["role"] == "user"]),
                 detected_language=self._current_lang,
                 recording_url=self._recording_url,
+                end_reason=reason,
             )
         except Exception as e:
             logger.warning(f"[NGO] call_ended emit error: {e}")
         finally:
             # Stop egress in background — don't block room deletion
             asyncio.ensure_future(self.stop_recording())
-            self._ctx.delete_room()
+            try:
+                self._ctx.delete_room()
+            except Exception:
+                pass  # room may already be gone if participant disconnected
+
+    # ── Session close handler: catch mid-call hangups ────────────────────────
+    def _on_session_close(self, ev) -> None:
+        """
+        Fired when the AgentSession closes for ANY reason:
+          - PARTICIPANT_DISCONNECTED (student hung up mid-call)
+          - JOB_SHUTDOWN, ERROR, USER_INITIATED, TASK_COMPLETED
+
+        If _emit_call_ended hasn't fired yet (i.e. no [END_CALL] was spoken),
+        we fire it now so the dashboard always gets:
+          • conversation transcript  → analysis
+          • recording_url            → audio player
+          • DB entry                 → call log
+        """
+        reason_str = ev.reason.value if hasattr(ev, "reason") else "unknown"
+        logger.info(f"[NGO] Session closed — reason={reason_str}")
+
+        if not self._call_ended_emitted:
+            logger.info(
+                f"[NGO] call_ended not yet emitted — firing now (reason={reason_str})"
+            )
+            asyncio.ensure_future(self._emit_call_ended(reason=reason_str))
 
     # ── tts_node: guard against script/language mismatch + [END_CALL] detection ──
     async def tts_node(self, text: AsyncIterable[str], model_settings: Any):
@@ -561,6 +600,12 @@ class NGOAssistant(Agent):
         turn_ctx: llm.ChatContext,
         new_message: llm.ChatMessage,
     ) -> None:
+        # ── Keep chat history bounded so we never exceed Groq's context window ─
+        # truncate() preserves the system prompt and keeps the last N items.
+        # 60 items ≈ 30 user+agent turns — well within the 30-turn minimum the
+        # user requested and within gpt-oss-120b's ~32k context window.
+        self._session.history.truncate(max_items=cfg.CHAT_HISTORY_MAX_ITEMS)
+
         llm_start_ms   = int(time.time() * 1000)
         llm_latency_ms = llm_start_ms - self._turn_start_ms if self._turn_start_ms else 0
 

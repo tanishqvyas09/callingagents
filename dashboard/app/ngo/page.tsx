@@ -18,15 +18,6 @@ const CallResultModal = dynamic(() => import("../../components/CallResultModal")
   ssr: false,
 });
 
-const RecordingsPanel = dynamic(() => import("../../components/RecordingsPanel"), {
-  ssr: false,
-  loading: () => (
-    <div className="flex items-center justify-center h-full text-slate-400 text-sm">
-      Loading recordings...
-    </div>
-  ),
-});
-
 interface DispatchResult {
   room_name: string;
   ws_url: string;
@@ -65,9 +56,6 @@ export default function NGOPage() {
 
   // Call result modal state
   const [callEndedPayload, setCallEndedPayload] = useState<CallEndedPayload | null>(null);
-
-  // Right panel tab
-  const [rightTab, setRightTab] = useState<"analytics" | "recordings">("analytics");
 
   const handleCallEnded = useCallback((payload: CallEndedPayload) => {
     setCallEndedPayload(payload);
@@ -476,81 +464,42 @@ export default function NGOPage() {
           </div>
         </aside>
 
-        {/* ── Right: Analytics / Recordings tabs ── */}
+        {/* ── Right: Analytics ── */}
         <section className="flex-1 bg-slate-900 border border-slate-800 rounded-2xl p-5 flex flex-col overflow-hidden">
-
-          {/* Tab bar */}
           <div className="flex items-center justify-between mb-4 flex-shrink-0">
-            <div className="flex items-center gap-1 bg-slate-800 rounded-xl p-1">
-              <button
-                onClick={() => setRightTab("analytics")}
-                className={`px-4 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
-                  rightTab === "analytics"
-                    ? "bg-emerald-700 text-white shadow"
-                    : "text-slate-400 hover:text-slate-200"
-                }`}
-              >
-                📡 Real-time Analytics
-              </button>
-              <button
-                onClick={() => setRightTab("recordings")}
-                className={`px-4 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
-                  rightTab === "recordings"
-                    ? "bg-sky-700 text-white shadow"
-                    : "text-slate-400 hover:text-slate-200"
-                }`}
-              >
-                🎙 Recordings
-              </button>
-            </div>
-            {rightTab === "analytics" && (
-              <span className="text-xs text-slate-600 font-mono">millisecond precision</span>
-            )}
-            {rightTab === "recordings" && (
-              <span className="text-xs text-slate-600">via Vobiz API</span>
-            )}
+            <h2 className="text-sm font-semibold text-slate-200 flex items-center gap-2">
+              <span className="w-5 h-5 rounded bg-emerald-600 flex items-center justify-center text-white text-xs">R</span>
+              Real-time Analytics
+            </h2>
+            <span className="text-xs text-slate-600 font-mono">millisecond precision</span>
           </div>
 
-          {/* Analytics tab */}
-          {rightTab === "analytics" && (
-            dispatchResult ? (
-              <div className="flex-1 overflow-hidden">
-                <NGOAnalytics
-                  wsUrl={dispatchResult.ws_url}
-                  token={dispatchResult.token}
-                  roomName={dispatchResult.room_name}
-                  onCallEnded={handleCallEnded}
-                />
-              </div>
-            ) : (
-              <div className="flex-1 flex flex-col items-center justify-center gap-6">
-                <div className="text-center space-y-2">
-                  <div className="text-4xl font-bold text-slate-700">Lajja</div>
-                  <p className="text-slate-500 text-sm max-w-sm leading-relaxed">
-                    Search for a student on the left and click{" "}
-                    <span className="text-rose-400 font-semibold">Call Now</span> to see live
-                    transcripts, detected languages, and per-turn latency metrics here.
-                  </p>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3 w-full max-w-sm">
-                  <MetricCard label="STT Latency"  sub="Time to transcript"    color="sky" />
-                  <MetricCard label="LLM Latency"  sub="Time to first token"   color="violet" />
-                  <MetricCard label="TTS TTFA"     sub="Time to first audio"   color="emerald" />
-                  <MetricCard label="E2E Latency"  sub="Speech to audio out"   color="rose" />
-                </div>
-              </div>
-            )
-          )}
-
-          {/* Recordings tab */}
-          {rightTab === "recordings" && (
+          {dispatchResult ? (
             <div className="flex-1 overflow-hidden">
-              <RecordingsPanel
-                defaultToNumber={
-                  dispatchResult?.phone_number ?? phoneNumber ?? null
-                }
+              <NGOAnalytics
+                wsUrl={dispatchResult.ws_url}
+                token={dispatchResult.token}
+                roomName={dispatchResult.room_name}
+                onCallEnded={handleCallEnded}
               />
+            </div>
+          ) : (
+            <div className="flex-1 flex flex-col items-center justify-center gap-6">
+              <div className="text-center space-y-2">
+                <div className="text-4xl font-bold text-slate-700">Lajja</div>
+                <p className="text-slate-500 text-sm max-w-sm leading-relaxed">
+                  Search for a student on the left and click{" "}
+                  <span className="text-rose-400 font-semibold">Call Now</span> to see live
+                  transcripts, detected languages, and per-turn latency metrics here.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3 w-full max-w-sm">
+                <MetricCard label="STT Latency"  sub="Time to transcript"    color="sky" />
+                <MetricCard label="LLM Latency"  sub="Time to first token"   color="violet" />
+                <MetricCard label="TTS TTFA"     sub="Time to first audio"   color="emerald" />
+                <MetricCard label="E2E Latency"  sub="Speech to audio out"   color="rose" />
+              </div>
             </div>
           )}
         </section>
