@@ -41,6 +41,14 @@ import ngo_config as cfg
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ngo-agent")
 
+# ─── Supabase S3 config (for LiveKit Egress → voice_recording bucket) ────────
+SUPABASE_S3_ACCESS_KEY  = os.getenv("SUPABASE_S3_ACCESS_KEY", "")
+SUPABASE_S3_SECRET      = os.getenv("SUPABASE_S3_SECRET", "")
+SUPABASE_S3_ENDPOINT    = os.getenv("SUPABASE_S3_ENDPOINT", "")
+SUPABASE_S3_REGION      = os.getenv("SUPABASE_S3_REGION", "us-east-1")
+SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "voice_recording")
+SUPABASE_URL            = os.getenv("SUPABASE_URL", "")
+
 
 # ─── Analytics Event Schema ───────────────────────────────────────────────────
 def _analytics_event(event_type: str, **payload) -> bytes:
@@ -203,6 +211,10 @@ class NGOAssistant(Agent):
         # delete on a genuine speaking→listening transition, not any listening event.
         self._agent_was_speaking: bool = False
 
+        # ── Egress (call recording) ─────────────────────────────────────────
+        self._egress_id: str | None = None
+        self._recording_url: str | None = None
+
         # Hook into session events
         session.on("user_input_transcribed", self._on_transcribed)
         session.on("agent_state_changed", self._on_agent_state_changed)
@@ -216,6 +228,69 @@ class NGOAssistant(Agent):
             )
         except Exception as e:
             logger.warning(f"[Analytics] publish failed: {e}")
+
+    # ── Call Recording (Egress) ──────────────────────────────────────────────
+    async def start_recording(self) -> None:
+        """Start a Room Composite Egress (audio-only MP3) → Supabase S3 bucket.
+
+        The file is uploaded to: voice_recording/{room_name}.mp3
+        The public URL is deterministic so we don't need to wait for completion.
+        """
+        if not all([SUPABASE_S3_ACCESS_KEY, SUPABASE_S3_SECRET, SUPABASE_S3_ENDPOINT]):
+            logger.warning("[Egress] Supabase S3 credentials not configured — skipping recording")
+            return
+
+        room_name = self._room.name
+        filename  = f"{room_name}.mp3"
+
+        # Build deterministic public URL (bucket is public)
+        self._recording_url = (
+            f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_STORAGE_BUCKET}/{filename}"
+        )
+
+        try:
+            s3_upload = api.S3Upload(
+                access_key=SUPABASE_S3_ACCESS_KEY,
+                secret=SUPABASE_S3_SECRET,
+                endpoint=SUPABASE_S3_ENDPOINT,
+                region=SUPABASE_S3_REGION,
+                bucket=SUPABASE_STORAGE_BUCKET,
+                force_path_style=True,
+            )
+
+            file_output = api.EncodedFileOutput(
+                file_type=api.EncodedFileType.MP3,
+                filepath=filename,
+                s3=s3_upload,
+            )
+
+            egress_info = await self._livekit_api.egress.start_room_composite_egress(
+                api.RoomCompositeEgressRequest(
+                    room_name=room_name,
+                    audio_only=True,
+                    file_outputs=[file_output],
+                )
+            )
+
+            self._egress_id = egress_info.egress_id
+            logger.info(f"[Egress] Started room composite egress: {self._egress_id} → {filename}")
+
+        except Exception as e:
+            logger.error(f"[Egress] Failed to start recording: {e}")
+            self._egress_id     = None
+            self._recording_url = None
+
+    async def stop_recording(self) -> None:
+        """Stop the running egress. Fire-and-forget — don't block the call hangup."""
+        if not self._egress_id:
+            return
+        try:
+            await self._livekit_api.egress.stop_egress(
+                api.StopEgressRequest(egress_id=self._egress_id)
+            )
+            logger.info(f"[Egress] Stop requested for {self._egress_id}")
+        except Exception as e:
+            logger.warning(f"[Egress] Stop failed (may already be stopped): {e}")
 
     # ── Language resolution ──────────────────────────────────────────────────
     def _resolve_tts_lang(self, stt_lang_code: str) -> str:
@@ -385,7 +460,7 @@ class NGOAssistant(Agent):
                 self._agent_was_speaking = False
 
     async def _emit_call_ended(self) -> None:
-        """Emit call_ended analytics event then delete the room."""
+        """Emit call_ended analytics event, stop egress, then delete the room."""
         try:
             await self._emit(
                 "call_ended",
@@ -396,10 +471,13 @@ class NGOAssistant(Agent):
                 school_city=self._school_city,
                 total_turns=len([t for t in self._conversation_log if t["role"] == "user"]),
                 detected_language=self._current_lang,
+                recording_url=self._recording_url,
             )
         except Exception as e:
             logger.warning(f"[NGO] call_ended emit error: {e}")
         finally:
+            # Stop egress in background — don't block room deletion
+            asyncio.ensure_future(self.stop_recording())
             self._ctx.delete_room()
 
     # ── tts_node: guard against script/language mismatch + [END_CALL] detection ──
@@ -567,6 +645,10 @@ async def entrypoint(ctx: agents.JobContext):
         agent=assistant,
         room_options=room_opts,
     )
+
+    # ── Start call recording (egress → Supabase S3) ─────────────────────────
+    # Fire-and-forget: don't delay the greeting
+    asyncio.ensure_future(assistant.start_recording())
 
     # ── Emit session-start analytics ─────────────────────────────────────────
     await assistant._emit(

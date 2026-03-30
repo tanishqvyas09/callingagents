@@ -225,6 +225,9 @@ export default function NGOAnalytics({ wsUrl, token, roomName, onCallEnded }: Pr
             school_city:       ev.school_city as string | null | undefined,
             total_turns:       ev.total_turns as number | undefined,
             detected_language: ev.detected_language as string | undefined,
+            phone_number:      sessionInfo?.phone_number ?? null,
+            room_name:         roomName,
+            recording_url:     ev.recording_url as string | null | undefined,
           });
         }
         break;

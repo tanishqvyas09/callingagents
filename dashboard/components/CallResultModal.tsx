@@ -13,7 +13,7 @@
  *  • Call metadata (language, outcome, turn count)
  */
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import type { AnalysisResult } from "../app/api/ngo-analyze/route";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -32,6 +32,9 @@ export interface CallEndedPayload {
   school_city?: string | null;
   total_turns?: number;
   detected_language?: string;
+  phone_number?: string | null;
+  room_name?: string | null;
+  recording_url?: string | null;
 }
 
 interface FullAnalysisResponse {
@@ -40,6 +43,8 @@ interface FullAnalysisResponse {
   student: { name?: string | null; age?: number | null; school?: string | null; city?: string | null };
   detected_language: string;
   analyzed_at: string;
+  saved_id?: string | null;
+  recording_url?: string | null;
 }
 
 interface Props {
@@ -119,7 +124,12 @@ export default function CallResultModal({ payload, onClose }: Props) {
   const [result, setResult]             = useState<FullAnalysisResponse | null>(null);
   const [activeTab, setActiveTab]       = useState<"overview" | "transcript" | "raw">("overview");
 
-  const runAnalysis = useCallback(async () => {
+  // Guard against React Strict Mode double-invoke — only fire once per payload
+  const analysisRunRef = useRef(false);
+
+  const runAnalysis = useCallback(async (forced = false) => {
+    if (!forced && analysisRunRef.current) return;
+    analysisRunRef.current = true;
     setLoading(true);
     setError(null);
     try {
@@ -133,6 +143,9 @@ export default function CallResultModal({ payload, onClose }: Props) {
           school_name:        payload.school_name,
           school_city:        payload.school_city,
           detected_language:  payload.detected_language,
+          phone_number:       payload.phone_number,
+          room_name:          payload.room_name,
+          recording_url:      payload.recording_url,
         }),
       });
       const json = await res.json();
@@ -207,7 +220,7 @@ export default function CallResultModal({ payload, onClose }: Props) {
             </div>
             <div className="flex gap-3">
               <button
-                onClick={runAnalysis}
+                onClick={() => runAnalysis(true)}
                 className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white text-sm rounded-lg"
               >
                 Retry Analysis
@@ -292,6 +305,24 @@ export default function CallResultModal({ payload, onClose }: Props) {
                       </div>
                     </div>
                   </div>
+
+                  {/* Call Recording Player */}
+                  {(result?.recording_url || payload.recording_url) && (
+                    <div className="bg-slate-800 border border-slate-700 rounded-2xl p-4">
+                      <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">🎙️ Call Recording</h3>
+                      <audio
+                        controls
+                        preload="none"
+                        className="w-full h-10 rounded-lg"
+                        src={result?.recording_url || payload.recording_url || ""}
+                      >
+                        Your browser does not support the audio element.
+                      </audio>
+                      <p className="text-xs text-slate-500 mt-2">
+                        Recording may take a few seconds to become available after the call ends.
+                      </p>
+                    </div>
+                  )}
 
                   {/* Sentiment breakdown */}
                   {analysis?.sentiment && (
@@ -387,12 +418,24 @@ export default function CallResultModal({ payload, onClose }: Props) {
 
             {/* ── Footer actions ── */}
             <div className="flex items-center justify-between px-6 py-4 border-t border-slate-800 bg-slate-950 flex-shrink-0">
-              <button
-                onClick={runAnalysis}
-                className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm rounded-lg transition-colors"
-              >
-                ↺ Re-analyze
-              </button>
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => runAnalysis(true)}
+                  className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm rounded-lg transition-colors"
+                >
+                  ↺ Re-analyze
+                </button>
+                {result?.saved_id && (
+                  <span className="text-xs text-emerald-400 flex items-center gap-1">
+                    <span>✓</span>
+                    <span>Saved to database</span>
+                    <span className="font-mono text-emerald-600 text-xs">#{result.saved_id.slice(0, 8)}</span>
+                  </span>
+                )}
+                {result && !result.saved_id && (
+                  <span className="text-xs text-amber-500">⚠ Not saved to DB</span>
+                )}
+              </div>
               <div className="flex gap-3">
                 <button
                   onClick={() => {

@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { supabaseServer } from "@/lib/supabase-server";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface ConversationTurn {
@@ -15,6 +16,9 @@ interface AnalyzeRequest {
   school_name?: string | null;
   school_city?: string | null;
   detected_language?: string;
+  phone_number?: string | null;
+  room_name?: string | null;
+  recording_url?: string | null;
 }
 
 export interface AnalysisResult {
@@ -62,7 +66,7 @@ function buildTranscriptText(turns: ConversationTurn[]): string {
 export async function POST(request: Request) {
   try {
     const body: AnalyzeRequest = await request.json();
-    const { conversation, student_name, student_age, school_name, school_city, detected_language } = body;
+    const { conversation, student_name, student_age, school_name, school_city, detected_language, phone_number, room_name, recording_url } = body;
 
     if (!conversation || conversation.length === 0) {
       return NextResponse.json({ error: "No conversation provided" }, { status: 400 });
@@ -177,13 +181,111 @@ IMPORTANT: Return ONLY valid JSON, no markdown, no explanation. Return exactly t
       analysis.sentiment.overall = computed;
     }
 
-    return NextResponse.json({
-      analysis,
-      transcript: conversation,
-      student: { name: student_name, age: student_age, school: school_name, city: school_city },
-      detected_language: detected_language ?? "hi-IN",
-      analyzed_at: new Date().toISOString(),
-    });
+    // ── Persist to Supabase ──────────────────────────────────────────────────
+    const analyzedAt = new Date().toISOString();
+    try {
+      // Derive call timestamps from first/last transcript turn
+      const firstTurn = conversation[0];
+      const lastTurn  = conversation[conversation.length - 1];
+      const startedAt = firstTurn ? new Date(firstTurn.ts_ms).toISOString() : null;
+      const endedAt   = lastTurn  ? new Date(lastTurn.ts_ms).toISOString()  : null;
+      const durationSeconds =
+        firstTurn && lastTurn
+          ? Math.round((lastTurn.ts_ms - firstTurn.ts_ms) / 1000)
+          : null;
+
+      const row = {
+        // Call metadata
+        room_name:              room_name     ?? null,
+        phone_number:           phone_number  ?? null,
+        call_started_at:        startedAt,
+        call_ended_at:          endedAt,
+        call_duration_seconds:  durationSeconds,
+        call_outcome:           analysis.call_outcome ?? null,
+        total_turns:            conversation.filter((t) => t.role === "user").length,
+        detected_language:      detected_language ?? analysis.language_used ?? null,
+        analyzed_at:            analyzedAt,
+
+        // Student details
+        student_name:           student_name ?? null,
+        student_age:            student_age  ?? null,
+        school_name:            school_name  ?? null,
+        school_city:            school_city  ?? null,
+
+        // Full transcript
+        transcript: conversation,
+
+        // AI summary
+        summary: analysis.summary ?? null,
+
+        // Sentiment scores
+        sentiment_overall:          analysis.sentiment?.overall             ?? null,
+        sentiment_engagement:       analysis.sentiment?.factors?.engagement        ?? null,
+        sentiment_comfort:          analysis.sentiment?.factors?.comfort           ?? null,
+        sentiment_awareness_gain:   analysis.sentiment?.factors?.awareness_gain    ?? null,
+        sentiment_product_adoption: analysis.sentiment?.factors?.product_adoption  ?? null,
+        sentiment_positivity:       analysis.sentiment?.factors?.positivity        ?? null,
+
+        // Sentiment reasoning (JSONB)
+        sentiment_reasoning: analysis.sentiment?.reasoning ?? null,
+
+        // Questionnaire answers
+        q1_previous_product:   analysis.questionnaire?.q1_previous_product  ?? null,
+        q2_received_book:      analysis.questionnaire?.q2_received_book      ?? null,
+        q3_shared_knowledge:   analysis.questionnaire?.q3_shared_knowledge   ?? null,
+        q4_using_kit:          analysis.questionnaire?.q4_using_kit          ?? null,
+        q5_cloth_pad_comfort:  analysis.questionnaire?.q5_cloth_pad_comfort  ?? null,
+        q6_will_continue:      analysis.questionnaire?.q6_will_continue      ?? null,
+        q7_barrier:            analysis.questionnaire?.q7_barrier            ?? null,
+        q8_session_rating:     analysis.questionnaire?.q8_session_rating     ?? null,
+
+        // Key insights
+        key_insights: analysis.key_insights ?? null,
+
+        // Call recording (from LiveKit Egress → Supabase bucket)
+        recording_url: recording_url ?? null,
+      };
+
+      const { data: inserted, error: dbError } = await supabaseServer
+        .from("ngo_call_results")
+        .insert(row)
+        .select("id")
+        .single();
+
+      if (dbError) {
+        // 23505 = unique_violation — duplicate row, safe to ignore
+        if (dbError.code === "23505") {
+          console.log("[ngo-analyze] Duplicate row skipped (dedup constraint)");
+        } else {
+          console.error("[ngo-analyze] Supabase insert error:", dbError.message);
+        }
+        // Don't fail the request — return analysis even if DB write fails
+      } else {
+        console.log("[ngo-analyze] Saved call result:", inserted?.id);
+      }
+
+      return NextResponse.json({
+        analysis,
+        transcript: conversation,
+        student: { name: student_name, age: student_age, school: school_name, city: school_city },
+        detected_language: detected_language ?? "hi-IN",
+        analyzed_at: analyzedAt,
+        saved_id: inserted?.id ?? null,
+        recording_url: recording_url ?? null,
+      });
+    } catch (dbErr) {
+      console.error("[ngo-analyze] Supabase unexpected error:", dbErr);
+      // Return analysis anyway
+      return NextResponse.json({
+        analysis,
+        transcript: conversation,
+        student: { name: student_name, age: student_age, school: school_name, city: school_city },
+        detected_language: detected_language ?? "hi-IN",
+        analyzed_at: analyzedAt,
+        saved_id: null,
+        recording_url: recording_url ?? null,
+      });
+    }
   } catch (err) {
     console.error("[ngo-analyze] error:", err);
     return NextResponse.json(
