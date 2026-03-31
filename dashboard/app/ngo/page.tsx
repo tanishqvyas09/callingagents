@@ -193,7 +193,13 @@ export default function NGOPage() {
               <p className="text-xs text-slate-400">Making the Difference NGO &mdash; Menstrual Hygiene Survey</p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-3">
+            <a
+              href="/ngo/dashboard"
+              className="px-3 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-500 text-xs font-medium text-white transition-colors"
+            >
+              📊 Dashboard
+            </a>
             {LANGUAGES.map((l) => (
               <span
                 key={l.code}

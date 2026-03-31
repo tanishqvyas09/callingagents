@@ -53,7 +53,6 @@ export async function POST(request: Request) {
             {
                 participantIdentity: particpantIdentity,
                 participantName: "Customer",
-                roomMetadata: metadata, // Pass metadata so Agent knows context
             }
         );
 
