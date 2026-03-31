@@ -16,6 +16,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabase-server";
 import { fetchAll } from "@/lib/supabase-fetch-all";
 import { normalisePhone } from "@/lib/supabase";
+import { STUDENT_TABLE, USE_TEST_TABLE } from "@/lib/table-config";
 import type { CampaignState } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -45,12 +46,15 @@ async function getStudentQueue() {
   try {
     students = await fetchAll((from, to) =>
       supabaseServer
-        .from("student_answer_sheets")
-        .select(`
-          id, student_name, student_name_english, contact_number, age,
-          school_id, school_name, campaign_type, project_id,
-          campaign_schools!school_id ( name, city, state )
-        `)
+        .from(STUDENT_TABLE)
+        .select(
+          USE_TEST_TABLE
+            ? `id, student_name, student_name_english, contact_number, age,
+               school_id, school_name, campaign_type, project_id`
+            : `id, student_name, student_name_english, contact_number, age,
+               school_id, school_name, campaign_type, project_id,
+               campaign_schools!school_id ( name, city, state )`
+        )
         .eq("is_deleted", false)
         .eq("campaign_type", "post")
         .not("contact_number", "is", null)
@@ -146,9 +150,9 @@ async function dispatchCall(student: {
 }
 
 // ── Wait for call to finish (poll ngo_call_results) ──────────────────────────
-async function waitForCallCompletion(roomName: string, maxWaitMs = 600_000) {
+async function waitForCallCompletion(roomName: string, maxWaitMs = 180_000) {
   const startTime = Date.now();
-  const pollInterval = 5_000; // 5 seconds
+  const pollInterval = 4_000; // 4 seconds
 
   while (Date.now() - startTime < maxWaitMs) {
     const { data } = await supabaseServer
@@ -165,6 +169,44 @@ async function waitForCallCompletion(roomName: string, maxWaitMs = 600_000) {
   }
 
   return null; // timeout
+}
+
+// ── Safety net: write an "unavailable" row if the agent didn't ───────────────
+async function writeUnavailableResult(student: {
+  student_name: string;
+  contact_e164: string;
+  age: number | null;
+  school_name: string | null;
+  school_city: string | null;
+}, roomName: string) {
+  const now = new Date().toISOString();
+  const { error } = await supabaseServer
+    .from("ngo_call_results")
+    .insert({
+      room_name:             roomName,
+      phone_number:          student.contact_e164,
+      call_started_at:       now,
+      call_ended_at:         now,
+      call_duration_seconds: 0,
+      call_outcome:          "unavailable",
+      total_turns:           0,
+      analyzed_at:           now,
+      student_name:          student.student_name,
+      student_age:           student.age,
+      school_name:           student.school_name,
+      school_city:           student.school_city,
+      transcript:            [],
+      summary:               "Call unavailable: timed out waiting for result",
+      key_insights:          ["Call was not answered or agent did not report back"],
+    })
+    .select("id")
+    .single();
+
+  if (error && error.code !== "23505") {
+    console.error(`[campaign] Failed to write unavailable result: ${error.message}`);
+  } else {
+    console.log(`[campaign] Wrote safety-net unavailable result for ${student.contact_e164}`);
+  }
 }
 
 // ── Campaign loop ────────────────────────────────────────────────────────────
@@ -194,16 +236,22 @@ async function runCampaignLoop() {
         const result = await dispatchCall(student);
         campaignState.currentRoomName = result.room_name;
 
-        // Wait for call to complete
+        // Wait for call to complete (agent writes result via /api/ngo-analyze)
         const callResult = await waitForCallCompletion(result.room_name);
 
         if (callResult) {
           console.log(`[campaign] Call completed: ${student.student_name} → ${callResult.call_outcome}`);
         } else {
-          console.log(`[campaign] Call timed out: ${student.student_name}`);
+          // Agent didn't write a result in time — write a safety-net "unavailable" row
+          console.log(`[campaign] Call timed out: ${student.student_name} — writing unavailable result`);
+          await writeUnavailableResult(student, result.room_name);
         }
       } catch (err) {
-        console.error(`[campaign] Call failed for ${student.student_name}:`, err);
+        console.error(`[campaign] Dispatch failed for ${student.student_name}:`, err);
+        // Dispatch itself failed (e.g. network error to ngo-dispatch API) —
+        // write an unavailable row so we don't retry this student forever.
+        const failedRoom = `ngo-failed-${Date.now()}`;
+        await writeUnavailableResult(student, failedRoom);
       }
 
       campaignState.processedCount++;

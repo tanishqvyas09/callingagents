@@ -8,6 +8,7 @@
 import { NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabase-server";
 import { fetchAll } from "@/lib/supabase-fetch-all";
+import { STUDENT_TABLE } from "@/lib/table-config";
 import type { DashboardStats } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -24,7 +25,7 @@ export async function GET() {
       age: number | null;
     }>((from, to) =>
       supabaseServer
-        .from("student_answer_sheets")
+        .from(STUDENT_TABLE)
         .select("id, contact_number, school_name, school_id, campaign_type, age")
         .eq("is_deleted", false)
         .eq("campaign_type", "post")

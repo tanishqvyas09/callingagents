@@ -19,6 +19,9 @@ interface AnalyzeRequest {
   phone_number?: string | null;
   room_name?: string | null;
   recording_url?: string | null;
+  /** When set (e.g. "unavailable"), skip Groq analysis and write a minimal row */
+  call_outcome_override?: string | null;
+  end_reason?: string | null;
 }
 
 export interface AnalysisResult {
@@ -66,7 +69,68 @@ function buildTranscriptText(turns: ConversationTurn[]): string {
 export async function POST(request: Request) {
   try {
     const body: AnalyzeRequest = await request.json();
-    const { conversation, student_name, student_age, school_name, school_city, detected_language, phone_number, room_name, recording_url } = body;
+    const { conversation, student_name, student_age, school_name, school_city, detected_language, phone_number, room_name, recording_url, call_outcome_override, end_reason } = body;
+
+    // ── Fast path: call failed / busy / unanswered ─────────────────────────
+    // The agent sends call_outcome_override="unavailable" when the call ended
+    // without any conversation (dial failed, busy, no answer, etc.).
+    // We skip Groq analysis and write a minimal "unavailable" row so the
+    // campaign poller can move on.
+    if (call_outcome_override && (!conversation || conversation.length === 0)) {
+      const now = new Date().toISOString();
+      const row = {
+        room_name:              room_name     ?? null,
+        phone_number:           phone_number  ?? null,
+        call_started_at:        now,
+        call_ended_at:          now,
+        call_duration_seconds:  0,
+        call_outcome:           call_outcome_override,
+        total_turns:            0,
+        detected_language:      detected_language ?? null,
+        analyzed_at:            now,
+        student_name:           student_name ?? null,
+        student_age:            student_age  ?? null,
+        school_name:            school_name  ?? null,
+        school_city:            school_city  ?? null,
+        transcript:             [],
+        summary:                `Call ${call_outcome_override}: ${end_reason || "no answer"}`,
+        sentiment_overall:      null,
+        sentiment_engagement:   null,
+        sentiment_comfort:      null,
+        sentiment_awareness_gain: null,
+        sentiment_product_adoption: null,
+        sentiment_positivity:   null,
+        sentiment_reasoning:    null,
+        q1_previous_product:    null,
+        q2_received_book:       null,
+        q3_shared_knowledge:    null,
+        q4_using_kit:           null,
+        q5_cloth_pad_comfort:   null,
+        q6_will_continue:       null,
+        q7_barrier:             null,
+        q8_session_rating:      null,
+        key_insights:           [end_reason || "Call was not answered"],
+        recording_url:          recording_url ?? null,
+      };
+
+      const { data: inserted, error: dbError } = await supabaseServer
+        .from("ngo_call_results")
+        .insert(row)
+        .select("id")
+        .single();
+
+      if (dbError && dbError.code !== "23505") {
+        console.error("[ngo-analyze] Supabase insert error (unavailable):", dbError.message);
+      } else {
+        console.log(`[ngo-analyze] Saved ${call_outcome_override} result: ${inserted?.id ?? "dedup"}`);
+      }
+
+      return NextResponse.json({
+        call_outcome: call_outcome_override,
+        saved_id: inserted?.id ?? null,
+        skipped_analysis: true,
+      });
+    }
 
     if (!conversation || conversation.length === 0) {
       return NextResponse.json({ error: "No conversation provided" }, { status: 400 });

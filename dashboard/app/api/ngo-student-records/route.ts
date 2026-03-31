@@ -17,6 +17,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabase-server";
 import { fetchAll } from "@/lib/supabase-fetch-all";
 import { normalisePhone } from "@/lib/supabase";
+import { STUDENT_TABLE, USE_TEST_TABLE } from "@/lib/table-config";
 
 export const dynamic = "force-dynamic";
 
@@ -29,15 +30,16 @@ export async function GET(req: NextRequest) {
     const callFilter = url.searchParams.get("call_filter") || "all";
     const search = url.searchParams.get("search")?.trim() || "";
 
-    // ── 1. Fetch students from student_answer_sheets ──────────────────────
+    // ── 1. Fetch students from student table ──────────────────────────────
     let query = supabaseServer
-      .from("student_answer_sheets")
+      .from(STUDENT_TABLE)
       .select(
-        `
-        id, student_name, student_name_english, contact_number, age,
-        school_id, school_name, campaign_type, percentage, grade, date,
-        campaign_schools!school_id ( name, city, state )
-      `,
+        USE_TEST_TABLE
+          ? `id, student_name, student_name_english, contact_number, age,
+             school_id, school_name, campaign_type, percentage, grade, date`
+          : `id, student_name, student_name_english, contact_number, age,
+             school_id, school_name, campaign_type, percentage, grade, date,
+             campaign_schools!school_id ( name, city, state )`,
         { count: "exact" }
       )
       .eq("is_deleted", false)
@@ -120,13 +122,14 @@ export async function GET(req: NextRequest) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const allStudents = await fetchAll<any>((from, to) => {
         let q = supabaseServer
-          .from("student_answer_sheets")
+          .from(STUDENT_TABLE)
           .select(
-            `
-            id, student_name, student_name_english, contact_number, age,
-            school_id, school_name, campaign_type, percentage, grade, date,
-            campaign_schools!school_id ( name, city, state )
-          `
+            USE_TEST_TABLE
+              ? `id, student_name, student_name_english, contact_number, age,
+                 school_id, school_name, campaign_type, percentage, grade, date`
+              : `id, student_name, student_name_english, contact_number, age,
+                 school_id, school_name, campaign_type, percentage, grade, date,
+                 campaign_schools!school_id ( name, city, state )`
           )
           .eq("is_deleted", false)
           .eq("campaign_type", campaignType)

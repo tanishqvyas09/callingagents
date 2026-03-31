@@ -27,6 +27,8 @@ os.environ["SSL_CERT_FILE"] = certifi.where()
 from dotenv import load_dotenv
 load_dotenv(".env")
 
+import aiohttp
+
 from livekit import agents, api, rtc
 from livekit.agents import AgentSession, Agent, RoomInputOptions
 from livekit.agents.voice.events import UserInputTranscribedEvent
@@ -48,6 +50,9 @@ SUPABASE_S3_ENDPOINT    = os.getenv("SUPABASE_S3_ENDPOINT", "")
 SUPABASE_S3_REGION      = os.getenv("SUPABASE_S3_REGION", "us-east-1")
 SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "voice_recording")
 SUPABASE_URL            = os.getenv("SUPABASE_URL", "")
+
+# ── Dashboard URL (for calling /api/ngo-analyze after each call) ─────────────
+DASHBOARD_BASE_URL = os.getenv("DASHBOARD_BASE_URL", "http://localhost:3000")
 
 
 # ─── Analytics Event Schema ───────────────────────────────────────────────────
@@ -140,6 +145,7 @@ class NGOAssistant(Agent):
         room: rtc.Room,
         livekit_api: api.LiveKitAPI,
         ctx: agents.JobContext,
+        phone_number: str | None = None,
         student_name: str | None = None,
         student_age: int | None = None,
         school_name: str | None = None,
@@ -179,6 +185,7 @@ class NGOAssistant(Agent):
         self._room         = room
         self._livekit_api  = livekit_api
         self._ctx          = ctx
+        self._phone_number = phone_number
         self._student_name = student_name
         self._student_age  = student_age
         self._school_name  = school_name
@@ -468,6 +475,8 @@ class NGOAssistant(Agent):
         """Emit call_ended analytics event, stop egress, then delete the room.
 
         Idempotent — safe to call from both [END_CALL] path and session-close path.
+        Also calls /api/ngo-analyze directly so results are saved even when
+        no browser client is in the room (e.g. auto-dialer mode).
         """
         if self._call_ended_emitted:
             logger.info("[NGO] _emit_call_ended already fired — skipping duplicate")
@@ -489,13 +498,61 @@ class NGOAssistant(Agent):
             )
         except Exception as e:
             logger.warning(f"[NGO] call_ended emit error: {e}")
-        finally:
-            # Stop egress in background — don't block room deletion
-            asyncio.ensure_future(self.stop_recording())
-            try:
-                self._ctx.delete_room()
-            except Exception:
-                pass  # room may already be gone if participant disconnected
+
+        # ── Call /api/ngo-analyze to save results to DB ──────────────────────
+        # This runs regardless of whether a browser client received the event.
+        asyncio.ensure_future(self._call_analyze_api(end_reason=reason))
+
+        # Stop egress in background — don't block room deletion
+        asyncio.ensure_future(self.stop_recording())
+        try:
+            self._ctx.delete_room()
+        except Exception:
+            pass  # room may already be gone if participant disconnected
+
+    async def _call_analyze_api(self, *, end_reason: str = "agent_end") -> None:
+        """POST the conversation to /api/ngo-analyze so Groq analyses and
+        saves the result to ngo_call_results — works even without a browser.
+
+        When the conversation is empty (dial failed, busy, no answer etc.)
+        we still POST a minimal payload with call_outcome='unavailable' so
+        that the campaign poller can move on instead of hanging forever.
+        """
+        url = f"{DASHBOARD_BASE_URL}/api/ngo-analyze"
+        has_conversation = bool(self._conversation_log)
+
+        payload = {
+            "conversation":      self._conversation_log,
+            "student_name":      self._student_name,
+            "student_age":       self._student_age,
+            "school_name":       self._school_name,
+            "school_city":       self._school_city,
+            "detected_language": self._current_lang,
+            "phone_number":      self._phone_number,
+            "room_name":         self._room.name,
+            "recording_url":     self._recording_url,
+        }
+
+        # If there's no conversation (call failed / busy / unanswered),
+        # tell the API to skip Groq analysis and just write an "unavailable" row.
+        if not has_conversation:
+            payload["call_outcome_override"] = "unavailable"
+            payload["end_reason"] = end_reason
+            logger.info(f"[NGO] No conversation — sending 'unavailable' to analyze API (reason={end_reason})")
+
+        try:
+            logger.info(f"[NGO] Calling {url} for {'analysis' if has_conversation else 'unavailable marker'}...")
+            async with aiohttp.ClientSession() as http:
+                async with http.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        logger.info(f"[NGO] Result saved — outcome={data.get('call_outcome', '?')}, "
+                                    f"sentiment={data.get('sentiment', {}).get('overall', '?')}")
+                    else:
+                        body = await resp.text()
+                        logger.error(f"[NGO] Analyze API returned {resp.status}: {body[:300]}")
+        except Exception as e:
+            logger.error(f"[NGO] Failed to call analyze API: {e}")
 
     # ── Session close handler: catch mid-call hangups ────────────────────────
     def _on_session_close(self, ev) -> None:
@@ -670,6 +727,7 @@ async def entrypoint(ctx: agents.JobContext):
         student_age=student_age,
         school_name=school_name,
         school_city=school_city,
+        phone_number=phone_number,
     )
 
     # Use RoomOptions (non-deprecated) for explicit AudioInputOptions control.
