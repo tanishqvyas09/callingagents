@@ -231,6 +231,70 @@ class NGOAssistant(Agent):
         session.on("agent_state_changed", self._on_agent_state_changed)
         session.on("close", self._on_session_close)
 
+    # ── Instant "hello" audio burst on connect ───────────────────────────────
+    async def play_hello_audio(self) -> None:
+        """Play pre-recorded assets/hello_hi.wav immediately after call connects.
+
+        This fills the ~3-4 second silence that normally occurs while the LLM
+        generates the first greeting, preventing the student from hanging up.
+        The WAV is read once, published as raw PCM via a temporary AudioSource,
+        then the track is unpublished so the agent's normal TTS takes over.
+        """
+        import wave as _wave
+        wav_path = os.path.join(os.path.dirname(__file__), "assets", "hello_hi.wav")
+        if not os.path.exists(wav_path):
+            logger.warning("[Hello] assets/hello_hi.wav not found — skipping instant hello")
+            return
+
+        try:
+            with _wave.open(wav_path, "rb") as wf:
+                sample_rate  = wf.getframerate()
+                num_channels = wf.getnchannels()
+                raw_pcm      = wf.readframes(wf.getnframes())
+
+            # Create a temporary AudioSource + track, publish it to the room
+            source = rtc.AudioSource(sample_rate, num_channels)
+            track  = rtc.LocalAudioTrack.create_audio_track("hello-burst", source)
+            pub    = await self._room.local_participant.publish_track(
+                track,
+                rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE),
+            )
+            logger.info("[Hello] Playing hello_hi.wav to caller ...")
+
+            # Stream PCM in 10ms chunks (sample_rate / 100 samples per chunk)
+            samples_per_chunk = sample_rate // 100          # 10ms worth
+            bytes_per_sample  = 2 * num_channels            # 16-bit
+            chunk_bytes       = samples_per_chunk * bytes_per_sample
+
+            pos = 0
+            while pos < len(raw_pcm):
+                chunk = raw_pcm[pos : pos + chunk_bytes]
+                if not chunk:
+                    break
+                # Pad last chunk if needed
+                if len(chunk) < chunk_bytes:
+                    chunk = chunk + b"\x00" * (chunk_bytes - len(chunk))
+
+                import array as _array
+                samples = _array.array("h", chunk)
+                frame   = rtc.AudioFrame(
+                    data=bytes(samples),
+                    sample_rate=sample_rate,
+                    num_channels=num_channels,
+                    samples_per_channel=samples_per_chunk,
+                )
+                await source.capture_frame(frame)
+                await asyncio.sleep(0.01)   # 10ms real-time pacing
+                pos += chunk_bytes
+
+            # Small tail silence so the last chunk plays out before we unpublish
+            await asyncio.sleep(0.15)
+            await self._room.local_participant.unpublish_track(pub.sid)
+            logger.info("[Hello] hello_hi.wav playback complete — handing over to TTS")
+
+        except Exception as e:
+            logger.warning(f"[Hello] play_hello_audio failed: {e}")
+
     # ── Data channel helper ──────────────────────────────────────────────────
     async def _emit(self, event_type: str, **payload):
         try:
@@ -795,6 +859,11 @@ async def entrypoint(ctx: agents.JobContext):
                 if session._room_io and sip_identity:
                     logger.info(f"[NGO] Binding audio input to {sip_identity}")
                     session._room_io.set_participant(sip_identity)
+
+                # ── Instant hello burst ──────────────────────────────────────
+                # Play pre-recorded "हैलो" immediately so the caller hears
+                # something right away while the LLM builds the real greeting.
+                await assistant.play_hello_audio()
 
             except Exception as e:
                 logger.error(f"[NGO] Dial failed: {e}")
