@@ -3,9 +3,8 @@ NGO Agent — Making the Difference / Team Lajja
 Menstrual Hygiene Awareness & Feedback Survey
 
 Features:
-  • Sarvam saaras:v3 STT with auto language detection (hi/en/te/…)
-  • Groq LLM (openai/gpt-oss-120b) via OpenAI-compatible API
-  • Sarvam bulbul:v3-beta TTS speaker=shubh, language switches per turn dynamically
+  • Google Gemini Live (gemini-3.1-flash-live-preview) — unified STT + LLM + TTS
+    via RealtimeModel (audio in → audio out, no separate Sarvam/Groq pipeline)
   • Outbound SIP calls via Vobiz trunk
   • Real-time analytics events emitted over LiveKit data channel
     (transcript, detected language, LLM response, TTS params, latencies)
@@ -17,10 +16,11 @@ Run:
 import os
 import time
 import json
+import wave
 import asyncio
 import logging
 import certifi
-from typing import Any, AsyncIterable
+from typing import Any  # noqa: used in on_user_turn_completed signature
 
 os.environ["SSL_CERT_FILE"] = certifi.where()
 
@@ -30,12 +30,13 @@ load_dotenv(".env")
 import aiohttp
 
 from livekit import agents, api, rtc
-from livekit.agents import AgentSession, Agent, RoomInputOptions
-from livekit.agents.voice.events import UserInputTranscribedEvent
-from livekit.plugins import sarvam, openai, silero, noise_cancellation
-from livekit.plugins.sarvam.stt import SpeechStream as _SarvamSpeechStream
+from livekit.agents import AgentSession, Agent
+from livekit.agents.voice.events import UserInputTranscribedEvent, ConversationItemAddedEvent
+from livekit.plugins import noise_cancellation
+from livekit.plugins.google.realtime import RealtimeModel
 from livekit.agents import llm
 from livekit.agents.voice.room_io import RoomOptions, AudioInputOptions
+from google.genai import types as genai_types
 
 import ngo_config as cfg
 
@@ -65,68 +66,98 @@ def _analytics_event(event_type: str, **payload) -> bytes:
     }).encode()
 
 
-# ─── TTS Factory ─────────────────────────────────────────────────────────────
-def _build_tts(language_code: str = None) -> sarvam.TTS:
-    lang = language_code or cfg.TTS_DEFAULT_LANGUAGE
-    logger.info(f"[TTS] building bulbul:v3-beta speaker={cfg.TTS_SPEAKER} lang={lang}")
-    return sarvam.TTS(
-        model=cfg.TTS_MODEL,
-        speaker=cfg.TTS_SPEAKER,
-        target_language_code=lang,
-        api_key=os.getenv("SARVAM_API_KEY"),
+# ─── Gemini Live RealtimeModel Factory ───────────────────────────────────────
+# gemini-3.1-flash-live-preview: unified STT + LLM + TTS in one WebSocket session.
+# • input_audio_transcription  → fires UserInputTranscribedEvent for language detection
+# • output_audio_transcription → fires ConversationItemAddedEvent with agent text
+#   (used for [END_CALL] detection and conversation logging)
+def _build_realtime_model(instructions: str) -> RealtimeModel:
+    logger.info(f"[Gemini] building RealtimeModel model={cfg.GEMINI_MODEL} voice={cfg.TTS_VOICE}")
+    return RealtimeModel(
+        model=cfg.GEMINI_MODEL,
+        voice=cfg.TTS_VOICE,
+        api_key=os.getenv("GOOGLE_API_KEY"),
+        instructions=instructions,
+        # No hardcoded language= hint — Gemini Live auto-detects the student's
+        # language from audio and responds in kind (per the system prompt instruction).
+        # Forcing a BCP-47 code here biases the model away from other languages.
+        input_audio_transcription=genai_types.AudioTranscriptionConfig(),
+        output_audio_transcription=genai_types.AudioTranscriptionConfig(),
+        temperature=0.7,   # slightly higher than 0.3 → more natural, less robotic replies
     )
 
 
-# ─── Sarvam STT plugin bug-fix ────────────────────────────────────────────────
-# The plugin sets _audio_encoding = input_audio_codec (e.g. "pcm_s16le"), but
-# the Sarvam API requires encoding="audio/wav" in the JSON audio message body.
-# input_audio_codec=pcm_s16le must appear only in the WebSocket URL, not the body.
-# Fix: subclass SpeechStream so _audio_encoding is always "audio/wav" after init,
-# and override STT.stream() to return our fixed stream class.
-class _FixedSpeechStream(_SarvamSpeechStream):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._audio_encoding = "audio/wav"   # Sarvam API body always requires "audio/wav"
+# ─── Hello-audio playback ─────────────────────────────────────────────────────
+HELLO_WAV_PATH = os.path.join(os.path.dirname(__file__), "assets", "hello_hi.wav")
+_HELLO_CHUNK_MS = 20   # 20ms frames — standard for WebRTC / LiveKit
 
 
-class _FixedSTT(sarvam.STT):
-    """sarvam.STT with audio message encoding bug fixed.
-
-    Bug: plugin sets _audio_encoding = input_audio_codec which breaks the Sarvam
-    API — the JSON audio body must have encoding='audio/wav' while the URL carries
-    input_audio_codec=pcm_s16le to indicate the binary format to the server.
+async def play_hello_audio(room: rtc.Room) -> None:
     """
-    def stream(self, **kwargs):
-        base_stream = super().stream(**kwargs)
-        # Replace with our fixed class that enforces correct encoding in the body
-        base_stream.__class__ = _FixedSpeechStream
-        base_stream._audio_encoding = "audio/wav"
-        return base_stream
+    Play assets/hello_hi.wav into the LiveKit room immediately after the call
+    is answered — before Gemini Live's first generate_reply fires.
 
+    The WAV must be 24 kHz, mono, 16-bit PCM (produced by generate_hello_audio.py).
+    We publish a short-lived AudioSource track, push all frames, then unpublish.
+    This gives the student an instant warm greeting (~300ms after answer) while
+    the Gemini WebSocket session warms up in parallel.
+    """
+    if not os.path.exists(HELLO_WAV_PATH):
+        logger.warning(f"[Hello] WAV not found at {HELLO_WAV_PATH} — skipping pre-recorded greeting")
+        return
 
-# ─── STT Factory ─────────────────────────────────────────────────────────────
-def _build_stt() -> sarvam.STT:
-    logger.info("[STT] building saaras:v3 language=unknown (auto-detect)")
-    return _FixedSTT(
-        model=cfg.STT_MODEL,
-        language=cfg.STT_LANGUAGE,        # "unknown" → auto-detect
-        sample_rate=16000,                # must match audio_sample_rate in RoomInputOptions
-        input_audio_codec="pcm_s16le",   # URL param only — tells server the binary codec
-        high_vad_sensitivity=True,        # better VAD sensitivity for telephony audio
-        api_key=os.getenv("SARVAM_API_KEY"),
-    )
+    try:
+        with wave.open(HELLO_WAV_PATH, "rb") as wf:
+            sample_rate   = wf.getframerate()   # 24000
+            num_channels  = wf.getnchannels()   # 1
+            sample_width  = wf.getsampwidth()   # 2  (16-bit)
+            raw_pcm       = wf.readframes(wf.getnframes())
 
+        frames_per_chunk = int(sample_rate * _HELLO_CHUNK_MS / 1000)
+        bytes_per_chunk  = frames_per_chunk * num_channels * sample_width
+        samples_per_chunk = frames_per_chunk * num_channels
 
-# ─── LLM Factory ─────────────────────────────────────────────────────────────
-def _build_llm() -> openai.LLM:
-    logger.info(f"[LLM] building Groq {cfg.LLM_MODEL}")
-    return openai.LLM(
-        base_url=cfg.LLM_BASE_URL,
-        api_key=os.getenv("GROQ_API_KEY"),
-        model=cfg.LLM_MODEL,
-        temperature=cfg.LLM_TEMPERATURE,
-        max_completion_tokens=cfg.LLM_MAX_COMPLETION_TOKENS,
-    )
+        source = rtc.AudioSource(sample_rate=sample_rate, num_channels=num_channels)
+        track  = rtc.LocalAudioTrack.create_audio_track("hello-greeting", source)
+        pub_opts = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
+        publication = await room.local_participant.publish_track(track, pub_opts)
+
+        logger.info(f"[Hello] Playing greeting WAV ({len(raw_pcm)} bytes, {sample_rate}Hz)")
+
+        offset = 0
+        while offset < len(raw_pcm):
+            chunk = raw_pcm[offset: offset + bytes_per_chunk]
+            if not chunk:
+                break
+            # Pad last chunk with silence if needed
+            if len(chunk) < bytes_per_chunk:
+                chunk = chunk + b'\x00' * (bytes_per_chunk - len(chunk))
+            frame = rtc.AudioFrame(
+                data=chunk,
+                sample_rate=sample_rate,
+                num_channels=num_channels,
+                samples_per_channel=samples_per_chunk,
+            )
+            await source.capture_frame(frame)
+            offset += bytes_per_chunk
+
+        # Small tail-silence so the last syllable doesn't get clipped
+        silence = b'\x00' * bytes_per_chunk * 5
+        frame = rtc.AudioFrame(
+            data=silence,
+            sample_rate=sample_rate,
+            num_channels=num_channels,
+            samples_per_channel=samples_per_chunk,
+        )
+        await source.capture_frame(frame)
+
+        await room.local_participant.unpublish_track(publication.sid)
+        logger.info("[Hello] Greeting WAV playback complete")
+
+    except Exception as e:
+        logger.error(f"[Hello] WAV playback failed: {e}")
+# Sarvam STT, Groq LLM, and GeminiTTS are no longer used.
+# gemini-3.1-flash-live-preview handles STT + LLM + TTS natively.
 
 
 # ─── NGO Agent ───────────────────────────────────────────────────────────────
@@ -177,9 +208,7 @@ class NGOAssistant(Agent):
 
         super().__init__(
             instructions=effective_prompt,
-            stt=_build_stt(),
-            llm=_build_llm(),
-            tts=_build_tts(cfg.TTS_DEFAULT_LANGUAGE),
+            llm=_build_realtime_model(effective_prompt),
         )
         self._session      = session
         self._room         = room
@@ -195,29 +224,38 @@ class NGOAssistant(Agent):
         self._last_transcript: str = ""
 
         # ── Full conversation transcript ─────────────────────────────────────
-        # Accumulated as the call progresses — emitted in call_ended event.
         # Each entry: {"role": "user"|"agent", "text": "...", "lang": "...", "ts_ms": int}
         self._conversation_log: list[dict] = []
 
-        # ── Language debounce: require 2 consecutive turns in same language ──
-        # before committing a permanent TTS switch.  This prevents single-word
-        # noise detections (e.g. "gu-IN" from one ambiguous utterance) from
-        # derailing the conversation language permanently.
-        self._pending_lang: str = cfg.TTS_DEFAULT_LANGUAGE  # candidate to switch to
-        self._lang_streak: int = 0                          # consecutive turns in pending_lang
-
         # ── End-call flag ────────────────────────────────────────────────────
-        # Set to True ONLY when [END_CALL] marker is detected in tts_node.
-        # _on_agent_state_changed watches for speaking → listening/idle
-        # and deletes the room only after TTS audio has fully played out.
-        #
-        # Safety: reset to False if a new user utterance arrives AFTER the flag
-        # was set — this means the LLM hallucinated [END_CALL] mid-call and the
-        # student is still talking.  We must NOT delete the room in that case.
+        # Set to True when farewell keyword ("alvida" etc.) is detected in
+        # _on_conversation_item_added.  A delayed async task then calls
+        # _emit_call_ended() after HANGUP_DELAY_S seconds.
+        # Safety: reset to False if a new user utterance arrives after the flag
+        # is set — means the student is still talking; do NOT hang up.
         self._end_call_pending: bool = False
         # Track whether the agent was in 'speaking' state so we only fire the
         # delete on a genuine speaking→listening transition, not any listening event.
         self._agent_was_speaking: bool = False
+
+        # ── Q8 completion tracker ─────────────────────────────────────────────
+        # Set to True when Gemini asks the "scale of 1 to 5" (Q8) question.
+        # After the student replies, a 45-second auto-hangup timer fires unless
+        # a farewell is detected sooner.  Prevents calls hanging forever if
+        # Gemini forgets to say "alvida".
+        self._q8_asked: bool = False
+        self._q8_hangup_task: asyncio.Task | None = None
+
+        # ── Max-call safety timer (8 minutes absolute ceiling) ───────────────
+        # Fires regardless of survey state — prevents zombie calls if Gemini
+        # gets stuck, student goes silent, or alvida is never spoken.
+        async def _max_call_timer():
+            await asyncio.sleep(8 * 60)
+            if not self._call_ended_emitted:
+                logger.warning("[NGO] Max call time (8 min) reached — forcing hangup")
+                await self._emit_call_ended(reason="max_call_time")
+
+        asyncio.ensure_future(_max_call_timer())
 
         # ── Egress (call recording) ─────────────────────────────────────────
         self._egress_id: str | None = None
@@ -230,70 +268,7 @@ class NGOAssistant(Agent):
         session.on("user_input_transcribed", self._on_transcribed)
         session.on("agent_state_changed", self._on_agent_state_changed)
         session.on("close", self._on_session_close)
-
-    # ── Instant "hello" audio burst on connect ───────────────────────────────
-    async def play_hello_audio(self) -> None:
-        """Play pre-recorded assets/hello_hi.wav immediately after call connects.
-
-        This fills the ~3-4 second silence that normally occurs while the LLM
-        generates the first greeting, preventing the student from hanging up.
-        The WAV is read once, published as raw PCM via a temporary AudioSource,
-        then the track is unpublished so the agent's normal TTS takes over.
-        """
-        import wave as _wave
-        wav_path = os.path.join(os.path.dirname(__file__), "assets", "hello_hi.wav")
-        if not os.path.exists(wav_path):
-            logger.warning("[Hello] assets/hello_hi.wav not found — skipping instant hello")
-            return
-
-        try:
-            with _wave.open(wav_path, "rb") as wf:
-                sample_rate  = wf.getframerate()
-                num_channels = wf.getnchannels()
-                raw_pcm      = wf.readframes(wf.getnframes())
-
-            # Create a temporary AudioSource + track, publish it to the room
-            source = rtc.AudioSource(sample_rate, num_channels)
-            track  = rtc.LocalAudioTrack.create_audio_track("hello-burst", source)
-            pub    = await self._room.local_participant.publish_track(
-                track,
-                rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE),
-            )
-            logger.info("[Hello] Playing hello_hi.wav to caller ...")
-
-            # Stream PCM in 10ms chunks (sample_rate / 100 samples per chunk)
-            samples_per_chunk = sample_rate // 100          # 10ms worth
-            bytes_per_sample  = 2 * num_channels            # 16-bit
-            chunk_bytes       = samples_per_chunk * bytes_per_sample
-
-            pos = 0
-            while pos < len(raw_pcm):
-                chunk = raw_pcm[pos : pos + chunk_bytes]
-                if not chunk:
-                    break
-                # Pad last chunk if needed
-                if len(chunk) < chunk_bytes:
-                    chunk = chunk + b"\x00" * (chunk_bytes - len(chunk))
-
-                import array as _array
-                samples = _array.array("h", chunk)
-                frame   = rtc.AudioFrame(
-                    data=bytes(samples),
-                    sample_rate=sample_rate,
-                    num_channels=num_channels,
-                    samples_per_channel=samples_per_chunk,
-                )
-                await source.capture_frame(frame)
-                await asyncio.sleep(0.01)   # 10ms real-time pacing
-                pos += chunk_bytes
-
-            # Small tail silence so the last chunk plays out before we unpublish
-            await asyncio.sleep(0.15)
-            await self._room.local_participant.unpublish_track(pub.sid)
-            logger.info("[Hello] hello_hi.wav playback complete — handing over to TTS")
-
-        except Exception as e:
-            logger.warning(f"[Hello] play_hello_audio failed: {e}")
+        session.on("conversation_item_added", self._on_conversation_item_added)
 
     # ── Data channel helper ──────────────────────────────────────────────────
     async def _emit(self, event_type: str, **payload):
@@ -379,8 +354,10 @@ class NGOAssistant(Agent):
         noise / misdetection and must be remapped:
           • North/central Indian scripts (gu, mr, bn, pa, ur, mai, …) → hi-IN
             (these overlap with Hindi phonetically and are nearby dialects)
-          • South Indian scripts outside Telugu (ta, kn, ml, …) → en-IN
-            (these students are more likely bilingual Hindi/English or English)
+          • South Indian scripts outside Telugu (ta, kn, ml, …) → hi-IN
+            (almost always STT misdetections of Hindi for these students;
+             previously mapped to en-IN which caused ~29s silences due to the
+             2-turn debounce needing 2× en-IN detections before switching)
           • Unrecognised / 'unknown' → keep current language (no flip)
         """
         if not stt_lang_code or stt_lang_code in ("unknown", ""):
@@ -393,11 +370,16 @@ class NGOAssistant(Agent):
         if prefix in PRIMARY:
             return PRIMARY[prefix]
 
-        # Non-Telugu south Indian scripts → fallback to English
+        # Non-Telugu south Indian scripts → fallback to Hindi
+        # Rationale: these students are from Hindi-speaking central India.
+        # Kannada/Tamil/Malayalam detections are almost always STT
+        # misdetections of Hindi (e.g. Devanagari ambiguity).
+        # Previously mapped to en-IN, which caused a 2-turn debounce delay
+        # (streak needing 2× en-IN) before any reply, creating ~29s silences.
         SOUTH_INDIAN_NON_TELUGU = {"ta", "kn", "ml"}
         if prefix in SOUTH_INDIAN_NON_TELUGU:
-            logger.info(f"[Lang] remapping {stt_lang_code} (south non-Telugu) → en-IN")
-            return "en-IN"
+            logger.info(f"[Lang] remapping {stt_lang_code} (south non-Telugu misdetection) → hi-IN")
+            return "hi-IN"
 
         # All other Indian languages (gu, mr, bn, pa, ur, or, as, mai, kok, …) → Hindi
         # These are either close to Hindi or are noise misdetections
@@ -420,59 +402,22 @@ class NGOAssistant(Agent):
         # the call is NOT over — clear the flag so we don't hang up.
         if self._end_call_pending:
             logger.warning(
-                "[NGO] Student spoke after [END_CALL] was set — cancelling pending delete "
-                f"(transcript='{transcript[:60]}'). LLM likely hallucinated the marker."
+                "[NGO] Student spoke after farewell was detected — cancelling pending delete "
+                f"(transcript='{transcript[:60]}'). Call is NOT over yet."
             )
             self._end_call_pending = False
 
         resolved = self._resolve_tts_lang(detected_lang_raw)
 
-        # ── Language debounce ────────────────────────────────────────────────
-        # We require LANG_SWITCH_THRESHOLD consecutive turns in the same new
-        # language before committing a TTS switch.  This prevents a single
-        # ambiguous utterance (e.g. one Gujarati-looking word) from derailing
-        # the active language for all subsequent replies.
-        LANG_SWITCH_THRESHOLD = 2
+        # ── Language tracking (analytics only) ──────────────────────────────
+        # Gemini Live handles multilingual responses natively — no TTS rebuild
+        # needed. We just track the detected language immediately for analytics.
+        lang_switched = (resolved != self._current_lang)
+        if lang_switched:
+            logger.info(f"[Lang] {self._current_lang} → {resolved} (detected from transcript)")
+            self._current_lang = resolved
 
-        if resolved == self._current_lang:
-            # Continuing in the same language — reset the streak counter
-            self._pending_lang = resolved
-            self._lang_streak  = 0
-            lang_switched = False
-        elif resolved == self._pending_lang:
-            # Another turn in the same candidate language — increment streak
-            self._lang_streak += 1
-            if self._lang_streak >= LANG_SWITCH_THRESHOLD:
-                # Threshold met — commit the switch
-                lang_switched = True
-                logger.info(
-                    f"[Lang] debounce threshold met ({self._lang_streak}/{LANG_SWITCH_THRESHOLD}), "
-                    f"switching TTS {self._current_lang} → {resolved}"
-                )
-                self._current_lang = resolved
-                self._lang_streak  = 0
-                new_tts = _build_tts(resolved)
-                self._tts = new_tts
-                self._session._tts = new_tts
-                logger.info(f"[TTS] switched to {resolved} (sync, debounced)")
-            else:
-                # Not enough consecutive turns yet — use current TTS for this reply
-                lang_switched = False
-                logger.info(
-                    f"[Lang] debounce pending {resolved} streak={self._lang_streak}/{LANG_SWITCH_THRESHOLD}"
-                    f" — keeping TTS {self._current_lang} for now"
-                )
-        else:
-            # Different candidate language — reset streak and record new candidate
-            self._pending_lang = resolved
-            self._lang_streak  = 1
-            lang_switched = False
-            logger.info(
-                f"[Lang] debounce: new candidate {resolved} (streak reset) "
-                f"— keeping TTS {self._current_lang}"
-            )
-
-        new_lang = self._current_lang  # actual TTS language used for this turn
+        new_lang = self._current_lang
 
         logger.info(
             f"[STT] transcript='{transcript}' lang_raw='{detected_lang_raw}' → {resolved}"
@@ -497,25 +442,19 @@ class NGOAssistant(Agent):
         ))
 
     async def _switch_tts_language(self, lang: str) -> None:
-        # Kept for compatibility — direct sync swap is used in _on_transcribed now
-        try:
-            new_tts = _build_tts(lang)
-            self._tts = new_tts
-            self._session._tts = new_tts
-            logger.info(f"[TTS] switched to {lang}")
-        except Exception as e:
-            logger.warning(f"[TTS-update] {e}")
+        # GeminiTTS is natively multilingual — no rebuild needed.
+        # Language is tracked in self._current_lang for analytics only.
+        logger.info(f"[TTS] language tracking updated to {lang} (GeminiTTS handles multilingual natively)")
 
     # ── Agent state change: delete room after speaking ends ──────────────────
     def _on_agent_state_changed(self, ev) -> None:
         """
-        Watch for the speaking → listening/idle transition.
-        When _end_call_pending is True (set by tts_node after stripping [END_CALL]),
-        this means the closing TTS has fully finished playing — safe to delete the room.
+        Fallback: if _end_call_pending is True AND the agent just finished speaking,
+        fire _emit_call_ended (covers edge cases where _delayed_hangup races with
+        a very fast state transition).
 
-        Guard: only fire on a genuine speaking→listening transition using
-        _agent_was_speaking. This prevents the 'listening' events that fire
-        between normal mid-call turns from accidentally triggering deletion.
+        Primary path: _on_conversation_item_added detects farewell → schedules
+        _emit_call_ended() after HANGUP_DELAY_S via asyncio.ensure_future.
         """
         new_state = ev.new_state if hasattr(ev, "new_state") else str(ev)
 
@@ -546,6 +485,10 @@ class NGOAssistant(Agent):
             logger.info("[NGO] _emit_call_ended already fired — skipping duplicate")
             return
         self._call_ended_emitted = True
+
+        # Cancel Q8 safety timer if it's still pending
+        if self._q8_hangup_task and not self._q8_hangup_task.done():
+            self._q8_hangup_task.cancel()
 
         try:
             await self._emit(
@@ -578,15 +521,22 @@ class NGOAssistant(Agent):
         """POST the conversation to /api/ngo-analyze so Groq analyses and
         saves the result to ngo_call_results — works even without a browser.
 
-        When the conversation is empty (dial failed, busy, no answer etc.)
-        we still POST a minimal payload with call_outcome='unavailable' so
-        that the campaign poller can move on instead of hanging forever.
+        Conversation is truncated to the last 40 turns (≈20 exchanges) before
+        sending to stay within the Groq TPM limit for openai/gpt-oss-120b.
         """
         url = f"{DASHBOARD_BASE_URL}/api/ngo-analyze"
         has_conversation = bool(self._conversation_log)
 
+        # Truncate to last 40 turns to avoid Groq TPM (8000 token) limit.
+        # A full 8-question survey is typically 20-30 turns; 40 is a safe cap
+        # that still gives the analyser the complete meaningful conversation.
+        MAX_TURNS = 40
+        log_to_send = self._conversation_log[-MAX_TURNS:] if len(self._conversation_log) > MAX_TURNS else self._conversation_log
+        if len(self._conversation_log) > MAX_TURNS:
+            logger.info(f"[NGO] Truncating conversation from {len(self._conversation_log)} → {MAX_TURNS} turns for analyze API")
+
         payload = {
-            "conversation":      self._conversation_log,
+            "conversation":      log_to_send,
             "student_name":      self._student_name,
             "student_age":       self._student_age,
             "school_name":       self._school_name,
@@ -640,80 +590,103 @@ class NGOAssistant(Agent):
             )
             asyncio.ensure_future(self._emit_call_ended(reason=reason_str))
 
-    # ── tts_node: guard against script/language mismatch + [END_CALL] detection ──
-    async def tts_node(self, text: AsyncIterable[str], model_settings: Any):
+    # ── Conversation item added: agent text → [END_CALL] + logging ──────────
+    def _on_conversation_item_added(self, ev: ConversationItemAddedEvent) -> None:
         """
-        Intercept TTS text stream to:
-        1. Detect output script and override TTS language if needed.
-        2. Strip [END_CALL] marker and schedule room deletion after audio finishes.
+        Fired by the RealtimeModel for every completed conversation turn.
+        We only process assistant (agent) turns here.
 
-        The LLM is instructed to append [END_CALL] at the end of its closing
-        message.  We strip it here before TTS synthesizes it (so it's never
-        spoken aloud) and schedule ctx.delete_room() which sends SIP BYE.
+        End-call detection strategy (robust to false positives):
+          • Only the word "alvida" triggers hangup — it is reserved exclusively
+            for the closing message in the system prompt.
+          • Guard 1: text must NOT contain a "?" — closing has no questions.
+          • Guard 2: "alvida" must appear in the LAST 60 chars of the text —
+            mid-sentence uses like "alvida karna chahiye" are skipped.
+          • Guard 3: if student speaks after flag is set, cancel (see _on_transcribed).
+
+        Backup: Q8 safety timer fires 45s after Q8 is asked regardless.
+        Backup: max-call timer fires after 8 minutes regardless.
         """
-        import re
-        import unicodedata
+        import re, unicodedata
 
-        # Buffer the entire LLM output text
-        chunks: list[str] = []
-        async for chunk in text:
-            chunks.append(chunk)
+        HANGUP_DELAY_S = 3.5   # seconds to wait after farewell before SIP BYE
 
-        accumulated = "".join(chunks)
+        # ONLY "alvida" triggers hangup — it is the one word the system prompt
+        # reserves exclusively for the closing message.  All other farewell-ish
+        # words (shukriya, dhanyawad, take care) appear constantly mid-call.
+        ALVIDA_PATTERN = re.compile(r'\balvida\b', re.IGNORECASE)
 
-        # ── [END_CALL] detection ─────────────────────────────────────────────
-        end_call_triggered = bool(re.search(r'\[END_CALL\]', accumulated, re.IGNORECASE))
-        if end_call_triggered:
-            # Strip the marker (and any surrounding whitespace) from spoken text
-            accumulated = re.sub(r'\s*\[END_CALL\]\s*', '', accumulated, flags=re.IGNORECASE).strip()
-            logger.info("[NGO] [END_CALL] marker detected — will delete room after TTS finishes")
-            # Set flag: _on_agent_state_changed will fire delete_room() once the
-            # agent transitions from 'speaking' back to 'listening'/'idle' — meaning
-            # the full closing audio has played out on the phone before BYE is sent.
+        item = ev.item
+        role = getattr(item, "role", None)
+        if role != "assistant":
+            return
+
+        text = getattr(item, "text_content", None) or ""
+        if not text:
+            return
+
+        # ── Farewell / end-call detection (strict guards) ────────────────────
+        if (
+            ALVIDA_PATTERN.search(text)                   # must contain "alvida"
+            and "?" not in text                           # closing has NO question
+            and ALVIDA_PATTERN.search(text[-80:])         # must be near the END
+            and not self._end_call_pending
+            and not self._call_ended_emitted
+        ):
+            logger.info(
+                f"[NGO] Farewell 'alvida' detected at end of closing turn — "
+                f"scheduling room delete in {HANGUP_DELAY_S}s"
+            )
             self._end_call_pending = True
-            # Rebuild chunks from cleaned text (marker stripped)
-            chunks = [accumulated] if accumulated else []
 
-        # ── Log agent turn to conversation log ───────────────────────────────
-        if accumulated:
+            async def _delayed_hangup():
+                await asyncio.sleep(HANGUP_DELAY_S)
+                await self._emit_call_ended()
+
+            asyncio.ensure_future(_delayed_hangup())
+
+        clean_text = text.strip()
+
+        # ── Q8 detection: "scale of 1 to 5" ─────────────────────────────────
+        Q8_PATTERN = re.compile(r'scale\s+of\s+1\s+(to|se)\s+5', re.IGNORECASE)
+        if Q8_PATTERN.search(text) and not self._q8_asked:
+            self._q8_asked = True
+            logger.info("[NGO] Q8 detected — arming 45-second auto-hangup safety timer")
+
+            async def _q8_hangup():
+                await asyncio.sleep(45)
+                if not self._call_ended_emitted:
+                    logger.warning("[NGO] Q8 safety timer expired — forcing hangup")
+                    await self._emit_call_ended(reason="q8_timeout")
+
+            self._q8_hangup_task = asyncio.ensure_future(_q8_hangup())
+
+        # ── Log to conversation log ──────────────────────────────────────────
+        if clean_text:
             self._conversation_log.append({
                 "role": "agent",
-                "text": accumulated,
+                "text": clean_text,
                 "lang": self._current_lang,
                 "ts_ms": int(time.time() * 1000),
             })
+            logger.info(f"[Agent] logged turn: '{clean_text[:80]}'")
 
-        # ── Script / language detection ──────────────────────────────────────
-        if accumulated:
+        # ── Language tracking from output script ────────────────────────────
+        if clean_text:
             latin = sum(
-                1 for c in accumulated
+                1 for c in clean_text
                 if unicodedata.category(c).startswith('L') and ord(c) < 128
             )
             total_letters = sum(
-                1 for c in accumulated
+                1 for c in clean_text
                 if unicodedata.category(c).startswith('L')
             )
             ratio = latin / max(total_letters, 1)
-            is_english = total_letters > 0 and ratio > 0.7
-
-            if is_english and self._current_lang not in ("en-IN", "en-US"):
-                logger.info(
-                    f"[TTS] LLM replied in English (ratio={ratio:.2f}) "
-                    f"but TTS lang={self._current_lang}; overriding → en-IN for this turn"
-                )
-                new_tts = _build_tts("en-IN")
-                self._tts = new_tts
-                self._session._tts = new_tts
+            if total_letters > 0 and ratio > 0.7 and self._current_lang not in ("en-IN", "en-US"):
+                logger.info(f"[Lang] Agent output is English (ratio={ratio:.2f}) — tracking as en-IN")
                 self._current_lang = "en-IN"
                 self._pending_lang = "en-IN"
                 self._lang_streak  = 0
-
-        # Yield the buffered chunks as an async generator
-        async def _replay() -> AsyncIterable[str]:
-            for c in chunks:
-                yield c
-
-        return Agent.default.tts_node(self, _replay(), model_settings)
 
     # ── on_user_turn_completed ───────────────────────────────────────────────
     async def on_user_turn_completed(
@@ -721,12 +694,8 @@ class NGOAssistant(Agent):
         turn_ctx: llm.ChatContext,
         new_message: llm.ChatMessage,
     ) -> None:
-        # ── Keep chat history bounded so we never exceed Groq's context window ─
-        # truncate() preserves the system prompt and keeps the last N items.
-        # 60 items ≈ 30 user+agent turns — well within the 30-turn minimum the
-        # user requested and within gpt-oss-120b's ~32k context window.
-        self._session.history.truncate(max_items=cfg.CHAT_HISTORY_MAX_ITEMS)
-
+        # History truncation is handled server-side by Gemini Live's
+        # context_window_compression. Still emit analytics.
         llm_start_ms   = int(time.time() * 1000)
         llm_latency_ms = llm_start_ms - self._turn_start_ms if self._turn_start_ms else 0
 
@@ -778,9 +747,8 @@ async def entrypoint(ctx: agents.JobContext):
     )
 
     # ── Build session ────────────────────────────────────────────────────────
-    session = AgentSession(
-        vad=silero.VAD.load(),
-    )
+    # Gemini Live has server-side VAD/turn detection built in — no separate VAD needed.
+    session = AgentSession()
 
     assistant = NGOAssistant(
         session=session,
@@ -794,11 +762,9 @@ async def entrypoint(ctx: agents.JobContext):
         phone_number=phone_number,
     )
 
-    # Use RoomOptions (non-deprecated) for explicit AudioInputOptions control.
-    # Do NOT pre-set participant_identity here — it causes a livekit 1.4.3 bug where
-    # set_participant() is called before room connects. We set it after dial instead.
+    # Gemini Live expects 16kHz PCM input (same as before).
     audio_input_opts = AudioInputOptions(
-        sample_rate=16000,                              # match Sarvam STT
+        sample_rate=16000,
         noise_cancellation=noise_cancellation.BVCTelephony(),
         pre_connect_audio=True,
     )
@@ -823,10 +789,8 @@ async def entrypoint(ctx: agents.JobContext):
         phone_number=phone_number or "voip",
         ngo=cfg.NGO_NAME,
         team=cfg.TEAM_NAME,
-        stt_model=cfg.STT_MODEL,
-        llm_model=cfg.LLM_MODEL,
-        tts_model=cfg.TTS_MODEL,
-        tts_speaker=cfg.TTS_SPEAKER,
+        gemini_model=cfg.GEMINI_MODEL,
+        tts_voice=cfg.TTS_VOICE,
         default_language=cfg.TTS_DEFAULT_LANGUAGE,
     )
 
@@ -860,10 +824,13 @@ async def entrypoint(ctx: agents.JobContext):
                     logger.info(f"[NGO] Binding audio input to {sip_identity}")
                     session._room_io.set_participant(sip_identity)
 
-                # ── Instant hello burst ──────────────────────────────────────
-                # Play pre-recorded "हैलो" immediately so the caller hears
-                # something right away while the LLM builds the real greeting.
-                await assistant.play_hello_audio()
+                # Gemini Live connects via persistent WebSocket — first reply
+                # arrives in ~300ms so no silent gap; no pre-recorded hello needed.
+
+                # Play pre-recorded greeting WAV immediately (Gemini Aoede voice,
+                # generated by generate_hello_audio.py).  Runs concurrently with
+                # Gemini's WebSocket warm-up so there is no silent gap.
+                asyncio.ensure_future(play_hello_audio(ctx.room))
 
             except Exception as e:
                 logger.error(f"[NGO] Dial failed: {e}")
@@ -880,13 +847,17 @@ async def entrypoint(ctx: agents.JobContext):
                 logger.info(f"[NGO] Binding to existing SIP participant {existing_sip}")
                 session._room_io.set_participant(existing_sip)
 
-        # Speak the opening line (Hindi by default), personalised if we have student info
+        # Wait for the WAV to finish playing (~1s) then let Gemini take over.
+        # generate_reply continues the conversation after the pre-recorded intro.
+        await asyncio.sleep(2.0)
         greeting = cfg.build_greeting(student_name, school_name)
         await session.generate_reply(instructions=greeting)
 
     else:
         # VoIP / inbound mode — greet immediately
         logger.info("[NGO] VoIP / inbound mode — greeting")
+        asyncio.ensure_future(play_hello_audio(ctx.room))
+        await asyncio.sleep(2.0)
         greeting = cfg.build_greeting(student_name, school_name)
         await session.generate_reply(instructions=greeting)
 
