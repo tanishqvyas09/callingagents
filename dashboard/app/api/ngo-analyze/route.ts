@@ -121,6 +121,19 @@ export async function POST(request: Request) {
 
       if (dbError && dbError.code !== "23505") {
         console.error("[ngo-analyze] Supabase insert error (unavailable):", dbError.message);
+      } else if (dbError?.code === "23505") {
+        // Agent already saved this row — fetch existing ID
+        const { data: existing } = await supabaseServer
+          .from("ngo_call_results")
+          .select("id")
+          .eq("room_name", room_name ?? "")
+          .maybeSingle();
+        console.log(`[ngo-analyze] Duplicate unavailable row — existing: ${existing?.id ?? "not found"}`);
+        return NextResponse.json({
+          call_outcome: call_outcome_override,
+          saved_id: existing?.id ?? null,
+          skipped_analysis: true,
+        });
       } else {
         console.log(`[ngo-analyze] Saved ${call_outcome_override} result: ${inserted?.id ?? "dedup"}`);
       }
@@ -317,9 +330,24 @@ IMPORTANT: Return ONLY valid JSON, no markdown, no explanation. Return exactly t
         .single();
 
       if (dbError) {
-        // 23505 = unique_violation — duplicate row, safe to ignore
+        // 23505 = unique_violation — duplicate row (agent already saved it first)
+        // Fetch the existing row so we can return a valid saved_id to the frontend
         if (dbError.code === "23505") {
-          console.log("[ngo-analyze] Duplicate row skipped (dedup constraint)");
+          console.log("[ngo-analyze] Duplicate row — fetching existing ID");
+          const { data: existing } = await supabaseServer
+            .from("ngo_call_results")
+            .select("id")
+            .eq("room_name", room_name ?? "")
+            .maybeSingle();
+          return NextResponse.json({
+            analysis,
+            transcript: conversation,
+            student: { name: student_name, age: student_age, school: school_name, city: school_city },
+            detected_language: detected_language ?? "hi-IN",
+            analyzed_at: analyzedAt,
+            saved_id: existing?.id ?? null,
+            recording_url: recording_url ?? null,
+          });
         } else {
           console.error("[ngo-analyze] Supabase insert error:", dbError.message);
         }
