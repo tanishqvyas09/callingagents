@@ -53,7 +53,10 @@ SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "voice_recording"
 SUPABASE_URL            = os.getenv("SUPABASE_URL", "")
 
 # ── Dashboard URL (for calling /api/ngo-analyze after each call) ─────────────
-DASHBOARD_BASE_URL = os.getenv("DASHBOARD_BASE_URL", "http://localhost:3000")
+# In Docker: set ANALYZE_API_URL=http://frontend:3000/api/ngo-analyze
+# Locally:   defaults to http://localhost:3000
+_dashboard_base = os.getenv("DASHBOARD_BASE_URL", "http://localhost:3000")
+ANALYZE_API_URL = os.getenv("ANALYZE_API_URL", f"{_dashboard_base}/api/ngo-analyze")
 
 
 # ─── Analytics Event Schema ───────────────────────────────────────────────────
@@ -524,7 +527,7 @@ class NGOAssistant(Agent):
         Conversation is truncated to the last 40 turns (≈20 exchanges) before
         sending to stay within the Groq TPM limit for openai/gpt-oss-120b.
         """
-        url = f"{DASHBOARD_BASE_URL}/api/ngo-analyze"
+        url = ANALYZE_API_URL
         has_conversation = bool(self._conversation_log)
 
         # Truncate to last 40 turns to avoid Groq TPM (8000 token) limit.
