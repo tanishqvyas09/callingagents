@@ -187,3 +187,40 @@ systemctl reload nginx      # apply without downtime
 | Build crash: `Missing LiveKit Credentials` | Top-level throw in lib file — make client lazy (see `server-utils.ts`) |
 | `supabaseKey is required` | Same pattern — `supabase-server.ts` or `supabase.ts` top-level init |
 | `.env` changes not picked up | Run `docker compose up -d` (restart), not just `docker compose restart` for env changes |
+| `lajja-frontend unhealthy` | `wget` not available in alpine image — use `node -e "require('http')..."` healthcheck |
+
+---
+
+## Errors We Hit During First Deploy (and fixes)
+
+### ❌ Error 1: `Missing LiveKit Credentials` at build time
+**Symptom:** `Error: Failed to collect page data for /api/dispatch` during `npm run build`  
+**Cause:** `dashboard/lib/server-utils.ts` had a top-level `throw new Error(...)` that fired when Next.js evaluated the module at build time (no env vars available then)  
+**Fix:** Wrapped `RoomServiceClient` and `SipClient` in a lazy `getLiveKitClients()` function. Used `Proxy` for backward-compatible `roomService` / `sipClient` exports.  
+**File:** `dashboard/lib/server-utils.ts`
+
+---
+
+### ❌ Error 2: `supabaseKey is required` at build time
+**Symptom:** `Error: Failed to collect page data for /api/ngo-analyze`  
+**Cause:** `supabase-server.ts` called `createClient(undefined, undefined)` at module top level — same pattern as above  
+**Fix:** Lazy singleton `getSupabaseServer()` function + `Proxy` export. Same fix applied to `supabase.ts` (public client).  
+**Files:** `dashboard/lib/supabase-server.ts`, `dashboard/lib/supabase.ts`
+
+---
+
+### ❌ Error 3: `Container lajja-frontend is unhealthy`
+**Symptom:** Build succeeded but `lajja-frontend` stayed unhealthy, `lajja-agent` failed to start (depends_on healthy)  
+**Cause:** Healthcheck used `wget` which is not installed in `node:20-alpine`  
+**Fix:** Replaced healthcheck with a native Node.js HTTP check:
+```yaml
+test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3000/', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))\""]
+```
+Also extended `start_period` from 30s → 60s and `retries` from 3 → 5.  
+**File:** `docker-compose.yml`
+
+---
+
+### ⚠️ Warning: `version` attribute is obsolete
+**Symptom:** `WARN: the attribute 'version' is obsolete` on every `docker compose` command  
+**Impact:** None — just a warning, can be removed from `docker-compose.yml` later
