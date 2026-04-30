@@ -8,22 +8,32 @@
  * to INSERT call results into ngo_call_results without needing a user session.
  */
 
-import { createClient } from "@supabase/supabase-js";
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
-const SUPABASE_URL          = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const SUPABASE_SERVICE_KEY  = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+let _client: SupabaseClient | null = null;
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-  console.warn(
-    "[supabase-server] NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not set. " +
-    "Supabase write operations will fail. Set SUPABASE_SERVICE_ROLE_KEY in .env.local."
-  );
+export function getSupabaseServer(): SupabaseClient {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) {
+    throw new Error(
+      "[supabase-server] NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not set."
+    );
+  }
+  if (!_client) {
+    _client = createClient(url, key, {
+      auth: {
+        autoRefreshToken: false,
+        persistSession: false,
+      },
+    });
+  }
+  return _client;
 }
 
-export const supabaseServer = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-  auth: {
-    // Disable automatic token refresh — not needed for service role
-    autoRefreshToken: false,
-    persistSession:   false,
+// Lazy proxy so existing `supabaseServer.xxx` call sites keep working
+export const supabaseServer = new Proxy({} as SupabaseClient, {
+  get(_target, prop) {
+    return getSupabaseServer()[prop as keyof SupabaseClient];
   },
 });

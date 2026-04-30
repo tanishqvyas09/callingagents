@@ -13,12 +13,27 @@
  *   - Numbers stored with a +91 prefix (13 chars like +919179487733) are also accepted
  */
 
-import { createClient } from "@supabase/supabase-js";
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const SUPABASE_KEY = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY!;
+let _client: SupabaseClient | null = null;
 
-export const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+function getSupabaseClient(): SupabaseClient {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY;
+  if (!url || !key) {
+    throw new Error("[supabase] NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY is not set.");
+  }
+  if (!_client) {
+    _client = createClient(url, key);
+  }
+  return _client;
+}
+
+export const supabase = new Proxy({} as SupabaseClient, {
+  get(_target, prop) {
+    return getSupabaseClient()[prop as keyof SupabaseClient];
+  },
+});
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
