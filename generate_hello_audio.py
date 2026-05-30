@@ -24,7 +24,7 @@ TTS_MODEL     = "gemini-3.1-flash-live-preview"
 TTS_VOICE     = "Aoede"
 SAMPLE_RATE   = 24000   # Gemini Live audio output is always 24 kHz PCM mono 16-bit
 
-TEXT = "Hello Mai Priya hu , Making the difference NGO Se!"
+TEXT = "Hello, kya meri awaaz aa rahi hai?"
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
